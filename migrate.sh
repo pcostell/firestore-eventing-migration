@@ -1,0 +1,232 @@
+#!/bin/bash
+
+# migrate.sh - Orchestrator for Firestore Shadow-Journal Migration
+
+set -e
+
+# --- Helper Functions ---
+
+log() {
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] $1"
+}
+
+error() {
+    echo "[ERROR] $1" >&2
+    exit 1
+}
+
+confirm() {
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        return 0
+    fi
+    read -p "$1 (y/n): " choice || true
+    case "$choice" in
+        y|Y ) return 0;;
+        * ) return 1;;
+    esac
+}
+
+usage() {
+    echo "Usage: $0 [run|cleanup] [options]"
+    echo ""
+    echo "Commands:"
+    echo "  run        Deploy Live Sink and start Dataflow Backfill"
+    echo "  cleanup    Remove migration infra and perform bulk delete of metadata"
+    echo ""
+    echo "Options for 'run':"
+    echo "  --source-project ID    Source GCP Project ID"
+    echo "  --source-db ID         Source Firestore Database ID"
+    echo "  --dest-project ID      Destination GCP Project ID"
+    echo "  --dest-db ID           Destination Firestore Database ID"
+    echo "  --workers N            Number of Dataflow workers (default: 5)"
+    echo ""
+    echo "Options for 'cleanup':"
+    echo "  --source-project ID    Source GCP Project ID (optional, defaults to dest)"
+    echo "  --dest-project ID      Destination GCP Project ID"
+    echo "  --dest-db ID           Destination Firestore Database ID"
+    exit 1
+}
+
+# --- Argument Parsing ---
+
+COMMAND=$1
+shift
+
+SOURCE_PROJECT=""
+SOURCE_DB=""
+DEST_PROJECT=""
+DEST_DB=""
+WORKERS=5
+
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        --source-project) SOURCE_PROJECT="$2"; shift ;;
+        --source-db) SOURCE_DB="$2"; shift ;;
+        --dest-project) DEST_PROJECT="$2"; shift ;;
+        --dest-db) DEST_DB="$2"; shift ;;
+        --workers) WORKERS="$2"; shift ;;
+        *) echo "Unknown parameter passed: $1"; usage ;;
+    esac
+    shift
+done
+
+# --- Core Logic ---
+
+run_migration() {
+    [[ -z "$SOURCE_PROJECT" || -z "$SOURCE_DB" || -z "$DEST_PROJECT" || -z "$DEST_DB" ]] && usage
+
+    log "Starting configuration and migration run..."
+
+    # 1. IAM Permissions Confirmation
+    DEST_PROJECT_NUMBER=$(gcloud projects describe "$DEST_PROJECT" --format="value(projectNumber)")
+    # Using the default compute engine service account for Dataflow and Cloud Functions
+    COMPUTE_SA="${DEST_PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+
+    log "This tool requires the following IAM permissions:"
+    log " - Destination Compute Service Account ($COMPUTE_SA) must have 'roles/datastore.viewer' on Source Project ($SOURCE_PROJECT)."
+    
+    if confirm "Would you like to grant this permission now?"; then
+        gcloud projects add-iam-policy-binding "$SOURCE_PROJECT" \
+            --member="serviceAccount:${COMPUTE_SA}" \
+            --role="roles/datastore.viewer" \
+            --condition=None --quiet
+    else
+        log "Continuing, assuming permissions are already set."
+    fi
+
+    # Grant permission for Source SA on Dest Project
+    SOURCE_PROJECT_NUMBER=$(gcloud projects describe "$SOURCE_PROJECT" --format="value(projectNumber)")
+    SOURCE_COMPUTE_SA="${SOURCE_PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+
+    log "This tool also requires the following IAM permissions for the Live Sink:"
+    log " - Source Compute Service Account ($SOURCE_COMPUTE_SA) must have 'roles/datastore.user' on Destination Project ($DEST_PROJECT)."
+    
+    if confirm "Would you like to grant this permission now?"; then
+        gcloud projects add-iam-policy-binding "$DEST_PROJECT" \
+            --member="serviceAccount:${SOURCE_COMPUTE_SA}" \
+            --role="roles/datastore.user" \
+            --condition=None --quiet
+    else
+        log "Continuing, assuming permissions are already set."
+    fi
+
+
+    # 2. Check Database edition for Indexing
+    log "Checking destination database edition..."
+    DB_DESC=$(gcloud firestore databases describe --project="$DEST_PROJECT" --database="$DEST_DB" --format=json)
+    DB_EDITION=$(echo "$DB_DESC" | grep -oP '"databaseEdition":\s*"\K[^"]+' || echo "STANDARD")
+
+    if [[ "$DB_EDITION" == "STANDARD" ]]; then
+        log "Destination is Standard/Native. Configuring index exclusions for _ShadowJournal..."
+        if confirm "Proceed with creating index exclusions for 'hwm'?"; then
+            # Exclusion for hwm
+            gcloud firestore indexes fields update hwm \
+                --collection-group="_ShadowJournal" \
+                --project="$DEST_PROJECT" \
+                --database="$DEST_DB" \
+                --disable-indexes --quiet || log "Warning: Could not set hwm exclusion. It might already exist."
+        fi
+    fi
+
+    # Comment out dataflow module temporarily to prevent Cloud Build from trying to build it during function deploy.
+    # It will be restored automatically on script exit using the absolute path.
+    trap 'sed -i "s|<!-- <module>dataflow</module> -->|<module>dataflow</module>|" /usr/local/google/home/pcostello/migration/pom.xml' EXIT
+    sed -i 's|^\s*<module>dataflow</module>|<!-- <module>dataflow</module> -->|' /usr/local/google/home/pcostello/migration/pom.xml
+
+    # Build fat jar locally
+    log "Building Fat JAR..."
+    mvn clean package -Pshade -pl functions-java -am -DskipTests -q || error "Failed to build fat jar."
+
+    # Create staging directory in workspace for deployment
+    STAGING_DIR="staging-deploy"
+    mkdir -p "$STAGING_DIR"
+    cp functions-java/target/firestore-migration-functions-1.0-SNAPSHOT-shaded.jar "$STAGING_DIR/function.jar"
+
+    # 3. Deploy Live Stream Sink (Cloud Function) from Fat JAR
+    log "Deploying Live Journal Sink (Cloud Function) from Fat JAR..."
+    
+    CURRENT_PROJECT=$(gcloud config get-value project 2>/dev/null || echo "pcostello-cloud")
+    log "Setting gcloud project to $SOURCE_PROJECT for deployment (was $CURRENT_PROJECT)"
+    gcloud config set project "$SOURCE_PROJECT" --quiet
+    
+    gcloud functions deploy firestore-migration-sink \
+        --project="$SOURCE_PROJECT" \
+        --runtime=java17 \
+        --source "$STAGING_DIR" \
+        --trigger-event-filters="type=google.cloud.firestore.document.v1.written,database=$SOURCE_DB" \
+        --entry-point=com.google.cloud.firestore.migration.LiveSinkFunction \
+        --set-env-vars="DEST_PROJECT=$DEST_PROJECT,DEST_DB=$DEST_DB" \
+        --region=us-central1 \
+        --gen2 --quiet \
+        --concurrency=50 \
+        --max-instances=250 \
+        --cpu=4 \
+        --memory=4Gi
+
+    rm -rf "$STAGING_DIR"
+    
+    log "Restoring gcloud project to $CURRENT_PROJECT"
+    gcloud config set project "$CURRENT_PROJECT" --quiet
+
+    log "Live Sink deployed. Waiting 10 minutes for Eventarc propagation and write-catching..."
+    sleep 600
+
+    # 4. Start Dataflow Backfill
+    log "Running Dataflow Backfill using exec:java..."
+    (
+        cd dataflow
+        mvn compile exec:java -Dexec.mainClass="com.google.cloud.firestore.migration.FirestoreMigrationPipeline" \
+            -Dexec.args="--project=\"$DEST_PROJECT\" \
+            --sourceProject=\"$SOURCE_PROJECT\" \
+            --sourceDatabase=\"$SOURCE_DB\" \
+            --destinationProject=\"$DEST_PROJECT\" \
+            --destinationDatabase=\"$DEST_DB\" \
+            --runner=DataflowRunner \
+            --experiments=use_runner_v2 \
+            --numWorkers=\"$WORKERS\" \
+            --region=us-central1"
+    )
+
+    log "Migration run initiated successfully. Monitor the Dataflow job in the Cloud Console."
+}
+
+cleanup_migration() {
+    SOURCE_PROJECT="${SOURCE_PROJECT:-$DEST_PROJECT}"
+    [[ -z "$SOURCE_PROJECT" || -z "$DEST_PROJECT" || -z "$DEST_DB" ]] && usage
+
+    log "Starting cleanup for $DEST_PROJECT / $DEST_DB..."
+
+    log "Checking for Eventarc triggers..."
+    TRIGGERS=$(gcloud eventarc triggers list --project="$SOURCE_PROJECT" --region=us-central1 --filter="destination.cloudRun.service=firestore-migration-sink" --format="value(name)" 2>/dev/null || true)
+    if [[ -n "$TRIGGERS" ]]; then
+        if confirm "Delete Eventarc triggers associated with firestore-migration-sink?"; then
+            for TRIGGER in $TRIGGERS; do
+                log "Deleting trigger $TRIGGER..."
+                gcloud eventarc triggers delete "$TRIGGER" --project="$SOURCE_PROJECT" --region=us-central1 --quiet || log "Warning: Could not delete trigger $TRIGGER"
+            done
+        fi
+    fi
+
+    if confirm "Delete the Live Journal Sink (Cloud Function)?"; then
+        gcloud functions delete firestore-migration-sink --project="$SOURCE_PROJECT" --region=us-central1 --gen2 --quiet || log "Function not found, skipping."
+    fi
+
+    log "Performing bulk delete of _ShadowJournal collection group..."
+    if confirm "Delete all documents in the '_ShadowJournal' collection group?"; then
+        gcloud alpha firestore bulk-delete \
+            --collection-ids="_ShadowJournal" \
+            --project="$DEST_PROJECT" \
+            --database="$DEST_DB" \
+            --quiet
+    fi
+
+    log "Cleanup complete."
+}
+
+# --- Execution ---
+
+case "$COMMAND" in
+    run) run_migration ;;
+    cleanup) cleanup_migration ;;
+    *) usage ;;
+esac

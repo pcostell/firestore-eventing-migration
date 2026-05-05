@@ -1,0 +1,30 @@
+# Maven
+target/
+*.class
+*.jar
+*.war
+*.ear
+.m2/
+
+# Logs and reports
+*.log
+*.out
+report.md
+
+# IDEs
+.idea/
+.vscode/
+*.iml
+*.iws
+*.ipr
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
+
+# Temporary files
+*.swp
+*~
