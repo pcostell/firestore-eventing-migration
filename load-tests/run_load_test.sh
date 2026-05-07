@@ -85,20 +85,51 @@ step_deploy_resources() {
         
     TRAFFIC_URL=$(gcloud run services describe firestore-traffic-generator --project "$PROJECT_ID" --region us-central1 --format="value(status.url)")
     
-    echo "Deploying k6 Load Generator Cloud Run Job..."
+    echo "Deploying k6 Load Generator Cloud Run Jobs..."
     mkdir -p k6-build
     cp load_test.js k6-build/
     chmod 644 k6-build/load_test.js
+    
+    # Write entrypoint wrapper to map exit code 108 (k6 abort) to 0 (success) for Cloud Run
+    cat <<'EOF' > k6-build/entrypoint.sh
+#!/bin/sh
+k6 "$@"
+EXIT_CODE=$?
+if [ $EXIT_CODE -eq 108 ]; then
+  echo "k6 aborted successfully (exit 108). Mapping to exit 0 for Cloud Run success."
+  exit 0
+else
+  exit $EXIT_CODE
+fi
+EOF
+    chmod 755 k6-build/entrypoint.sh
+
     cat <<EOF > k6-build/Dockerfile
 FROM grafana/k6:latest
+USER root
 COPY load_test.js /load_test.js
-ENTRYPOINT ["k6"]
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+USER k6
+ENTRYPOINT ["/entrypoint.sh"]
 EOF
 
     gcloud builds submit --tag gcr.io/"$PROJECT_ID"/firestore-k6-load:latest k6-build/
     rm -rf k6-build
 
-    gcloud run jobs deploy firestore-k6-load \
+    # Configure QPS based on test scale (Option B vs Dry Run)
+    if [ "$DRY_RUN" = "true" ]; then
+        LOADER_QPS=100
+        TRAFFIC_QPS=10
+    else
+        # Flat 10K QPS Data Loader: 250 QPS/task * 40 tasks = 10,000 QPS
+        LOADER_QPS=250
+        # Static Base Live Traffic: 250 QPS/task * 40 tasks = 10,000 QPS
+        TRAFFIC_QPS=250
+    fi
+
+    echo "Deploying firestore-k6-loader job (QPS per task: $LOADER_QPS)..."
+    gcloud run jobs deploy firestore-k6-loader \
         --image gcr.io/"$PROJECT_ID"/firestore-k6-load:latest \
         --project "$PROJECT_ID" \
         --region us-central1 \
@@ -106,30 +137,44 @@ EOF
         --task-timeout 168h \
         --cpu 2 \
         --memory 8Gi \
-        --set-env-vars "TARGET_URL=$TRAFFIC_URL,DRY_RUN=$DRY_RUN" \
+        --set-env-vars "TARGET_URL=$TRAFFIC_URL,DRY_RUN=$DRY_RUN,QPS_PER_TASK=$LOADER_QPS,MODE=setup" \
+        --args="run,/load_test.js,--summary-mode=disabled" \
         --quiet
+
+    echo "Deploying firestore-k6-traffic job (QPS per task: $TRAFFIC_QPS)..."
+    gcloud run jobs deploy firestore-k6-traffic \
+        --image gcr.io/"$PROJECT_ID"/firestore-k6-load:latest \
+        --project "$PROJECT_ID" \
+        --region us-central1 \
+        --tasks 40 \
+        --task-timeout 168h \
+        --cpu 2 \
+        --memory 8Gi \
+        --set-env-vars "TARGET_URL=$TRAFFIC_URL,DRY_RUN=$DRY_RUN,QPS_PER_TASK=$TRAFFIC_QPS,MODE=run" \
+        --args="run,/load_test.js,--summary-mode=disabled" \
+        --quiet
+
+
   )
   log_step_end "Deploy Resources" "$start"
 }
 
 step_load_initial_data() {
   local start=$(log_step_start "Load Initial Data")
-  echo "Executing Setup Cloud Run Job (k6 in setup mode)..."
-  gcloud run jobs execute firestore-k6-load \
+  echo "Executing Setup Cloud Run Job (k6 Data Loader)..."
+  gcloud run jobs execute firestore-k6-loader \
       --project "$PROJECT_ID" \
       --region us-central1 \
-      --args="run,/load_test.js,-e,MODE=setup,--summary-mode=disabled" \
       --wait
   log_step_end "Load Initial Data" "$start"
 }
 
 step_start_traffic() {
   local start=$(log_step_start "Start Traffic")
-  echo "Starting Live Traffic (k6 in run mode)..."
-  gcloud run jobs execute firestore-k6-load \
+  echo "Starting Live Traffic (k6 in run mode asynchronously)..."
+  gcloud run jobs execute firestore-k6-traffic \
       --project "$PROJECT_ID" \
-      --region us-central1 \
-      --args="run,/load_test.js,-e,MODE=run,--summary-mode=disabled"
+      --region us-central1
   log_step_end "Start Traffic" "$start"
 }
 
@@ -180,7 +225,7 @@ step_validate_metrics() {
     START_TIME=$(date -u -d "5 minutes ago" +"%Y-%m-%dT%H:%M:%SZ")
     END_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     TOKEN=$(gcloud auth application-default print-access-token 2>/dev/null || gcloud auth print-access-token)
-    METRICS_OUT=$(curl -s -H "Authorization: Bearer $TOKEN" "https://monitoring.googleapis.com/v3/projects/${PROJECT_ID}/timeSeries?filter=metric.type%3D%22custom.googleapis.com%2Fmigration%2Fdoc_count%22%20AND%20metric.labels.source%3D%22live%22&interval.startTime=${START_TIME}&interval.endTime=${END_TIME}")
+    METRICS_OUT=$(curl -s -H "Authorization: Bearer $TOKEN" "https://monitoring.googleapis.com/v3/projects/${PROJECT_ID}/timeSeries?filter=metric.type%3D%22logging.googleapis.com%2Fuser%2Fmigration_doc_count%22%20AND%20metric.labels.source%3D%22live%22&interval.startTime=${START_TIME}&interval.endTime=${END_TIME}")
     
     echo "Debug: Metrics response: $METRICS_OUT"
     
@@ -212,8 +257,8 @@ step_run_lag_monitor() {
 
 step_stop_load_generator() {
   local start=$(log_step_start "Stop Load Generator")
-  echo "Stopping all active k6 Load Generator executions..."
-  ACTIVE_EXECS=$(gcloud run jobs executions list --job firestore-k6-load --project="$PROJECT_ID" --region us-central1 --filter="NOT (status.conditions.type=Completed AND (status.conditions.status=True OR status.conditions.status=False))" --format="value(name)")
+  echo "Stopping all active k6 Live Traffic executions..."
+  ACTIVE_EXECS=$(gcloud run jobs executions list --job firestore-k6-traffic --project="$PROJECT_ID" --region us-central1 --format="json" | jq -r '.[] | select(.status.completionTime == null) | .metadata.name')
   for exec_name in $ACTIVE_EXECS; do
     echo "Cancelling active execution: $exec_name"
     gcloud run jobs executions cancel "$exec_name" --project="$PROJECT_ID" --region us-central1 --quiet || true
@@ -228,7 +273,7 @@ step_wait_for_propagation() {
     START_TIME=$(date -u -d "2 minutes ago" +"%Y-%m-%dT%H:%M:%SZ")
     END_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     
-    METRICS_OUT=$(curl -s -H "Authorization: Bearer $(gcloud auth print-access-token)" "https://monitoring.googleapis.com/v3/projects/${PROJECT_ID}/timeSeries?filter=metric.type%3D%22custom.googleapis.com%2Fmigration%2Fdoc_count%22%20AND%20metric.labels.source%3D%22live%22&interval.startTime=${START_TIME}&interval.endTime=${END_TIME}")
+    METRICS_OUT=$(curl -s -H "Authorization: Bearer $(gcloud auth print-access-token)" "https://monitoring.googleapis.com/v3/projects/${PROJECT_ID}/timeSeries?filter=metric.type%3D%22logging.googleapis.com%2Fuser%2Fmigration_doc_count%22%20AND%20metric.labels.source%3D%22live%22&interval.startTime=${START_TIME}&interval.endTime=${END_TIME}")
     
     if [[ "$METRICS_OUT" == *"\"points\""* ]]; then
       echo "Writes are still propagating ($i/10)..."
@@ -273,13 +318,13 @@ TOTAL_START=$(date +%s)
 step_create_databases
 step_build_artifacts
 step_deploy_resources
-step_load_initial_data
-step_start_traffic
-step_initiate_migration
+step_start_traffic       # 1. Start background Live Traffic asynchronously (2K -> 10K QPS)
+step_load_initial_data   # 2. Start Data Loader (10K QPS flat) and WAIT (blocks until 100M docs are loaded)
+step_initiate_migration  # 3. Deploy GCF Live Sink and start Dataflow backfill AFTER loader finishes
 step_wait_for_dataflow
 step_validate_metrics
 step_run_lag_monitor
-step_stop_load_generator
+step_stop_load_generator # 4. Stop background Live Traffic
 step_wait_for_propagation
 step_verification
 

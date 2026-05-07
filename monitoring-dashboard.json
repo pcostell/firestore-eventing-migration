@@ -10,43 +10,6 @@
         "height": 16,
         "width": 24,
         "widget": {
-          "title": "Lag Time",
-          "id": "",
-          "xyChart": {
-            "chartOptions": {
-              "displayHorizontal": false,
-              "mode": "COLOR",
-              "showLegend": false
-            },
-            "dataSets": [
-              {
-                "breakdowns": [],
-                "dimensions": [],
-                "legendTemplate": "",
-                "measures": [],
-                "plotType": "LINE",
-                "sort": [],
-                "targetAxis": "Y1",
-                "timeSeriesQuery": {
-                  "outputFullDuration": false,
-                  "prometheusQuery": "{\"custom.googleapis.com/migration/lag_ms\", monitored_resource=\"global\"}",
-                  "unitOverride": "ms"
-                }
-              }
-            ],
-            "thresholds": [],
-            "yAxis": {
-              "label": "",
-              "scale": "LINEAR"
-            }
-          }
-        }
-      },
-      {
-        "xPos": 24,
-        "height": 16,
-        "width": 24,
-        "widget": {
           "title": "Live Doc Count (QPS)",
           "id": "",
           "xyChart": {
@@ -66,7 +29,7 @@
                 "targetAxis": "Y1",
                 "timeSeriesQuery": {
                   "outputFullDuration": false,
-                  "prometheusQuery": "sum by (op) (sum_over_time({\"custom.googleapis.com/migration/doc_count\",\n  monitored_resource=\"global\", source=\"live\"}[1m])) / 60",
+                  "prometheusQuery": "sum by (op) (sum_over_time({\"logging.googleapis.com/user/migration_doc_count\", source=\"live\"}[1m])) / 60",
                   "unitOverride": ""
                 }
               }
@@ -74,6 +37,36 @@
             "thresholds": [],
             "yAxis": {
               "label": "QPS",
+              "scale": "LINEAR"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 24,
+        "height": 16,
+        "width": 24,
+        "widget": {
+          "title": "Live Lag Time",
+          "xyChart": {
+            "chartOptions": {
+              "displayHorizontal": false,
+              "mode": "COLOR"
+            },
+            "dataSets": [
+              {
+                "legendTemplate": "Max Lag Time",
+                "plotType": "LINE",
+                "targetAxis": "Y1",
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum(increase(logging_googleapis_com:user_migration_lag_ms_sum{monitored_resource=\"cloud_run_revision\"}[1m])) / sum(increase(logging_googleapis_com:user_migration_lag_ms_count{monitored_resource=\"cloud_run_revision\"}[1m]))",
+                  "unitOverride": "ms"
+                }
+              }
+            ],
+            "thresholds": [],
+            "yAxis": {
+              "label": "Lag Time",
               "scale": "LINEAR"
             }
           }
@@ -132,17 +125,26 @@
         "width": 24,
         "widget": {
           "title": "Firestore Write Operations",
+          "id": "",
           "xyChart": {
             "chartOptions": {
               "displayHorizontal": false,
-              "mode": "COLOR"
+              "mode": "COLOR",
+              "showLegend": false
             },
             "dataSets": [
               {
+                "breakdowns": [],
+                "dimensions": [],
+                "legendTemplate": "",
+                "measures": [],
                 "plotType": "LINE",
+                "sort": [],
                 "targetAxis": "Y1",
                 "timeSeriesQuery": {
-                  "prometheusQuery": "sum by (\"database_id\")(rate({\"__name__\"=\"firestore.googleapis.com/document/write_ops_count\",\"monitored_resource\"=\"firestore.googleapis.com/Database\"}[${__interval}]))\nor\nsum by (\"database_id\")(rate({\"__name__\"=\"firestore.googleapis.com/document/delete_ops_count\",\"monitored_resource\"=\"firestore.googleapis.com/Database\"}[${__interval}]))\n"
+                  "outputFullDuration": false,
+                  "prometheusQuery": "sum by (\"database_id\")(rate({\"__name__\"=\"firestore.googleapis.com/document/write_ops_count\",\"monitored_resource\"=\"firestore.googleapis.com/Database\"}[${__interval}]))\nor\nsum by (\"database_id\")(rate({\"__name__\"=\"firestore.googleapis.com/document/delete_ops_count\",\"monitored_resource\"=\"firestore.googleapis.com/Database\"}[${__interval}]))\n",
+                  "unitOverride": ""
                 }
               }
             ],

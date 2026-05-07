@@ -128,10 +128,17 @@ run_migration() {
         fi
     fi
 
-    # Comment out dataflow module temporarily to prevent Cloud Build from trying to build it during function deploy.
-    # It will be restored automatically on script exit using the absolute path.
-    trap 'sed -i "s|<!-- <module>dataflow</module> -->|<module>dataflow</module>|" /usr/local/google/home/pcostello/migration/pom.xml' EXIT
-    sed -i 's|^\s*<module>dataflow</module>|<!-- <module>dataflow</module> -->|' /usr/local/google/home/pcostello/migration/pom.xml
+    # 2.5. Deploy Log-Based Metrics for monitoring
+    log "Deploying Log-Based Metrics to Source Project ($SOURCE_PROJECT)..."
+    gcloud logging metrics create migration_doc_count \
+        --config-from-file=functions-java/monitoring/metric-doc-count.json \
+        --project="$SOURCE_PROJECT" \
+        --quiet || log "Warning: Could not create metric 'migration_doc_count'. It may already exist."
+
+    gcloud logging metrics create migration_lag_ms \
+        --config-from-file=functions-java/monitoring/metric-lag-ms.json \
+        --project="$SOURCE_PROJECT" \
+        --quiet || log "Warning: Could not create metric 'migration_lag_ms'. It may already exist."
 
     # Build fat jar locally
     log "Building Fat JAR..."
@@ -209,6 +216,18 @@ cleanup_migration() {
 
     if confirm "Delete the Live Journal Sink (Cloud Function)?"; then
         gcloud functions delete firestore-migration-sink --project="$SOURCE_PROJECT" --region=us-central1 --gen2 --quiet || log "Function not found, skipping."
+    fi
+
+    log "Checking for Log-Based Metrics..."
+    if gcloud logging metrics describe migration_doc_count --project="$SOURCE_PROJECT" &>/dev/null; then
+        if confirm "Delete Log-Based Metric 'migration_doc_count'?"; then
+            gcloud logging metrics delete migration_doc_count --project="$SOURCE_PROJECT" --quiet
+        fi
+    fi
+    if gcloud logging metrics describe migration_lag_ms --project="$SOURCE_PROJECT" &>/dev/null; then
+        if confirm "Delete Log-Based Metric 'migration_lag_ms'?"; then
+            gcloud logging metrics delete migration_lag_ms --project="$SOURCE_PROJECT" --quiet
+        fi
     fi
 
     log "Performing bulk delete of _ShadowJournal collection group..."

@@ -1,6 +1,7 @@
 package com.google.cloud.firestore.migration;
 
 import com.google.api.core.ApiFutures;
+import com.google.cloud.Timestamp;
 import com.google.cloud.firestore.CollectionReference;
 import com.google.cloud.firestore.DocumentReference;
 import com.google.cloud.firestore.DocumentSnapshot;
@@ -14,8 +15,6 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.MockitoJUnitRunner;
 
-import java.time.Instant;
-import java.util.Date;
 import java.util.Map;
 
 import static org.junit.Assert.assertEquals;
@@ -65,7 +64,7 @@ public class FirestoreSinkTest {
         // Setup: existing HWM is at epoch 1000
         when(journalSnap.exists()).thenReturn(true);
         when(journalSnap.contains("hwm")).thenReturn(true);
-        when(journalSnap.getDate("hwm")).thenReturn(Date.from(Instant.ofEpochSecond(1000)));
+        when(journalSnap.getTimestamp("hwm")).thenReturn(Timestamp.ofTimeSecondsAndNanos(1000, 0));
 
         // Incoming is at epoch 1001
         Document doc = createIncomingDoc(1001);
@@ -80,7 +79,7 @@ public class FirestoreSinkTest {
         verify(transaction).set(eq(journalRef), journalCaptor.capture());
         
         Map<String, Object> journalData = journalCaptor.getValue();
-        assertEquals(Date.from(Instant.ofEpochSecond(1001)), journalData.get("hwm"));
+        assertEquals(Timestamp.ofTimeSecondsAndNanos(1001, 0), journalData.get("hwm"));
         verify(metrics).recordOperation(MigrationMetrics.Operation.WRITE);
     }
 
@@ -89,7 +88,7 @@ public class FirestoreSinkTest {
         // Setup: existing HWM is at epoch 1000
         when(journalSnap.exists()).thenReturn(true);
         when(journalSnap.contains("hwm")).thenReturn(true);
-        when(journalSnap.getDate("hwm")).thenReturn(Date.from(Instant.ofEpochSecond(1000)));
+        when(journalSnap.getTimestamp("hwm")).thenReturn(Timestamp.ofTimeSecondsAndNanos(1000, 0));
 
         // Incoming is at epoch 999
         Document doc = createIncomingDoc(999);
@@ -107,7 +106,7 @@ public class FirestoreSinkTest {
         // Setup: existing HWM is at epoch 1000
         when(journalSnap.exists()).thenReturn(true);
         when(journalSnap.contains("hwm")).thenReturn(true);
-        when(journalSnap.getDate("hwm")).thenReturn(Date.from(Instant.ofEpochSecond(1000)));
+        when(journalSnap.getTimestamp("hwm")).thenReturn(Timestamp.ofTimeSecondsAndNanos(1000, 0));
 
         // Incoming is at epoch 1000
         Document doc = createIncomingDoc(1000);
@@ -142,11 +141,11 @@ public class FirestoreSinkTest {
         // Setup: existing HWM is at epoch 1000
         when(journalSnap.exists()).thenReturn(true);
         when(journalSnap.contains("hwm")).thenReturn(true);
-        when(journalSnap.getDate("hwm")).thenReturn(Date.from(Instant.ofEpochSecond(1000)));
+        when(journalSnap.getTimestamp("hwm")).thenReturn(Timestamp.ofTimeSecondsAndNanos(1000, 0));
 
         // Incoming delete is at epoch 1001
         String fullPath = "projects/test-project/databases/(default)/documents/test_data/doc1";
-        Instant commitTime = Instant.ofEpochSecond(1001);
+        Timestamp commitTime = Timestamp.ofTimeSecondsAndNanos(1001, 0);
 
         // Execute
         sink.process(fullPath, commitTime, null);
@@ -158,7 +157,7 @@ public class FirestoreSinkTest {
         verify(transaction).set(eq(journalRef), journalCaptor.capture());
         
         Map<String, Object> journalData = journalCaptor.getValue();
-        assertEquals(Date.from(Instant.ofEpochSecond(1001)), journalData.get("hwm"));
+        assertEquals(Timestamp.ofTimeSecondsAndNanos(1001, 0), journalData.get("hwm"));
         verify(metrics).recordOperation(MigrationMetrics.Operation.DELETE);
     }
 
@@ -167,11 +166,11 @@ public class FirestoreSinkTest {
         // Setup: existing HWM is at epoch 1000
         when(journalSnap.exists()).thenReturn(true);
         when(journalSnap.contains("hwm")).thenReturn(true);
-        when(journalSnap.getDate("hwm")).thenReturn(Date.from(Instant.ofEpochSecond(1000)));
+        when(journalSnap.getTimestamp("hwm")).thenReturn(Timestamp.ofTimeSecondsAndNanos(1000, 0));
 
         // Incoming delete is at epoch 999
         String fullPath = "projects/test-project/databases/(default)/documents/test_data/doc1";
-        Instant commitTime = Instant.ofEpochSecond(999);
+        Timestamp commitTime = Timestamp.ofTimeSecondsAndNanos(999, 0);
 
         // Execute
         sink.process(fullPath, commitTime, null);
@@ -189,7 +188,7 @@ public class FirestoreSinkTest {
 
         // Incoming delete is at epoch 100
         String fullPath = "projects/test-project/databases/(default)/documents/test_data/doc1";
-        Instant commitTime = Instant.ofEpochSecond(100);
+        Timestamp commitTime = Timestamp.ofTimeSecondsAndNanos(100, 0);
 
         // Execute
         sink.process(fullPath, commitTime, null);
@@ -201,7 +200,7 @@ public class FirestoreSinkTest {
         verify(transaction).set(eq(journalRef), journalCaptor.capture());
         
         Map<String, Object> journalData = journalCaptor.getValue();
-        assertEquals(Date.from(Instant.ofEpochSecond(100)), journalData.get("hwm"));
+        assertEquals(Timestamp.ofTimeSecondsAndNanos(100, 0), journalData.get("hwm"));
         verify(metrics).recordOperation(MigrationMetrics.Operation.DELETE);
     }
 }

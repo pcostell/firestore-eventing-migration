@@ -33,18 +33,18 @@ This command deploys the live sink, waits 10 minutes for propagation, and starts
 *   Check the **Dataflow UI** in the Google Cloud Console for backfill progress.
 *   View **Cloud Monitoring** in the Destination project. You can use the following filters or PromQL queries in the Metrics Explorer to monitor progress:
 
-    **Live Traffic Document Count:**
-    *   **Filter**: `metric.type="custom.googleapis.com/migration/doc_count" AND metric.labels.source="live"`
+    **Live Traffic Document Count (Log-Based):**
+    *   **Filter**: `metric.type="logging.googleapis.com/user/migration_doc_count" AND metric.labels.source="live"`
     *   **PromQL**:
         ```promql
-        sum by (op) ({"custom.googleapis.com/migration/doc_count", monitored_resource="global", source="live"})
+        sum by (op) ({"logging.googleapis.com/user/migration_doc_count", monitored_resource="global", source="live"})
         ```
 
-    **Migration Lag:**
-    *   **Filter**: `metric.type="custom.googleapis.com/migration/lag_ms"`
+    **Migration Lag (Log-Based):**
+    *   **Filter**: `metric.type="logging.googleapis.com/user/migration_lag_ms"`
     *   **PromQL**:
         ```promql
-        {"custom.googleapis.com/migration/lag_ms", monitored_resource="global"}
+        {"logging.googleapis.com/user/migration_lag_ms", monitored_resource="global"}
         ``` 
 *   Generate a **Monitoring Dashboard** on Cloud Monitoring.
     *   ```bash

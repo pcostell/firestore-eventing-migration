@@ -92,6 +92,8 @@ public class TrafficGeneratorApp implements HttpFunction {
             response.setStatusCode(200);
             response.getWriter().write("OK processed " + count + " operations");
         } catch (InterruptedException | ExecutionException e) {
+            System.err.println("ERROR writing to Firestore: " + e.getMessage());
+            e.printStackTrace(System.err);
             response.setStatusCode(500);
             response.getWriter().write("Error writing to Firestore: " + e.getMessage());
         }

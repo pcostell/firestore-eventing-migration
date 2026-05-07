@@ -1,12 +1,12 @@
 package com.google.cloud.firestore.migration;
 
+import com.google.cloud.Timestamp;
 import com.google.cloud.firestore.DocumentReference;
 import com.google.cloud.firestore.DocumentSnapshot;
 import com.google.cloud.firestore.Firestore;
 import com.google.firestore.v1.Document;
 import com.google.firestore.v1.Value;
 
-import java.time.Instant;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
@@ -27,11 +27,11 @@ public class FirestoreSink {
 
   public void process(Document doc) {
     com.google.protobuf.Timestamp updateTime = doc.getUpdateTime();
-    Instant commitTime = Instant.ofEpochSecond(updateTime.getSeconds(), updateTime.getNanos());
+    Timestamp commitTime = Timestamp.ofTimeSecondsAndNanos(updateTime.getSeconds(), updateTime.getNanos());
     process(doc.getName(), commitTime, doc);
   }
 
-  public void process(String fullPath, Instant commitTime, Document doc) {
+  public void process(String fullPath, Timestamp commitTime, Document doc) {
     String path = fullPath.substring(fullPath.indexOf("/documents/") + 11);
     DocumentReference destDocRef = db.document(path);
     String hashedName = hashDocName(fullPath);
@@ -41,10 +41,15 @@ public class FirestoreSink {
     try {
       db.runTransaction(transaction -> {
         DocumentSnapshot journalSnap = transaction.get(journalRef).get();
-        Instant existingHwm = journalSnap.exists() && journalSnap.contains("hwm")
-            ? journalSnap.getDate("hwm").toInstant() : Instant.EPOCH;
+        Timestamp existingHwm = Timestamp.ofTimeSecondsAndNanos(0, 0);
+        if (journalSnap.exists() && journalSnap.contains("hwm")) {
+          Timestamp ts = journalSnap.getTimestamp("hwm");
+          if (ts != null) {
+            existingHwm = ts;
+          }
+        }
 
-        if (commitTime.isAfter(existingHwm)) {
+        if (commitTime.compareTo(existingHwm) > 0) {
           if (doc == null) {
             transaction.delete(destDocRef);
             operation.set(MigrationMetrics.Operation.DELETE);
@@ -56,7 +61,7 @@ public class FirestoreSink {
           }
 
           Map<String, Object> journalData = new HashMap<>();
-          journalData.put("hwm", Date.from(commitTime));
+          journalData.put("hwm", commitTime);
 
           transaction.set(journalRef, journalData);
         } else {
@@ -75,8 +80,11 @@ public class FirestoreSink {
       }
 
       // We use the current time as an approximation of the destination write time
-      // because the transaction API does not return the commit timestamp.
-      long lagMillis = Instant.now().toEpochMilli() - commitTime.toEpochMilli();
+      // because the java transaction runner does not return the commit timestamp.
+      // Time skew is expected to be small (millliseconds).
+      long currentMillis = System.currentTimeMillis();
+      long commitMillis = (commitTime.getSeconds() * 1000) + (commitTime.getNanos() / 1000000);
+      long lagMillis = currentMillis - commitMillis;
       metrics.recordLag(lagMillis);
 
     } catch (Exception e) {

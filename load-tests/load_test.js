@@ -7,22 +7,57 @@ const taskCount = parseInt(__ENV.CLOUD_RUN_TASK_COUNT || '1', 10);
 const dryRun = __ENV.DRY_RUN === 'true';
 const mode = __ENV.MODE || 'run'; // 'setup' or 'run'
 
-const TOTAL_DOCS = dryRun ? 10000 : 20000000;
+const TOTAL_DOCS = dryRun ? 10000 : 100000000;
 const DOCS_PER_TASK = TOTAL_DOCS / taskCount;
 
 const qpsPerTask = parseInt(__ENV.QPS_PER_TASK || (dryRun ? '100' : '500'), 10);
 const durationSeconds = mode === 'setup' ? (DOCS_PER_TASK / qpsPerTask) : 604800; // 7 days for run
 
+const ratePerMinute = Math.round((qpsPerTask * 60) / 100);
+let scenario = {};
+
+if (mode === 'setup') {
+    // Flat 10K QPS total across 40 tasks for the Data Loader (250 QPS/task = 15,000 rate/min per task)
+    const loaderRate = Math.round((250 * 60) / 100);
+    scenario = {
+        executor: 'constant-arrival-rate',
+        rate: loaderRate,
+        timeUnit: '1m',
+        duration: `${durationSeconds}s`,
+        preAllocatedVUs: 150,
+        maxVUs: 1000,
+    };
+} else {
+    // Ramping background live traffic to prevent minute-1 database throttling:
+    // Starting at 2K QPS total across 40 tasks (50 QPS/task = 3,000 rate/min per task)
+    // Stage 1 (0-5 min)  : Stay at 2K QPS (50 QPS/task)
+    // Stage 2 (5-10 min) : Ramp to 4K QPS (100 QPS/task)
+    // Stage 3 (10-15 min): Ramp to 8K QPS (200 QPS/task)
+    // Stage 4 (15+ min)  : Stay at static 10K QPS (250 QPS/task) target
+    const rate50 = Math.round((50 * 60) / 100);
+    const rate100 = Math.round((100 * 60) / 100);
+    const rate200 = Math.round((200 * 60) / 100);
+    const rate250 = Math.round((250 * 60) / 100);
+
+    scenario = {
+        executor: 'ramping-arrival-rate',
+        startRate: rate50, 
+        timeUnit: '1m',
+        preAllocatedVUs: 50,
+        maxVUs: 500,
+        stages: [
+            { target: rate50, duration: '300s' },   // 5 mins at 2K QPS
+            { target: rate100, duration: '300s' },  // Ramp to 4K QPS in 5 mins
+            { target: rate200, duration: '300s' },  // Ramp to 8K QPS in 5 mins
+            { target: rate250, duration: '300s' },  // Ramp to static 10K QPS in 5 mins
+            { target: rate250, duration: `${durationSeconds}s` } // Stay at 10K QPS until completed
+        ],
+    };
+}
+
 export const options = {
     scenarios: {
-        constant_request_rate: {
-            executor: 'constant-arrival-rate',
-            rate: qpsPerTask / 100,
-            timeUnit: '1s',
-            duration: `${durationSeconds}s`,
-            preAllocatedVUs: 100,
-            maxVUs: 500,
-        },
+        load_test_scenario: scenario
     },
     discardResponseBodies: true,
 };
@@ -80,6 +115,8 @@ function getAuthToken() {
     return cachedToken;
 }
 
+let currentIdx = 0;
+
 export default function () {
     const baseUrl = __ENV.TARGET_URL;
     if (!baseUrl) {
@@ -96,9 +133,16 @@ export default function () {
     const batchSize = 100;
 
     if (mode === 'setup') {
-        const baseIdx = execution.scenario.iterationInTest * batchSize;
+        // Stop if we have successfully completed all our assigned docs
+        if (currentIdx >= DOCS_PER_TASK) {
+            console.log(`Task index ${taskIndex} successfully completed all ${DOCS_PER_TASK} inserts. Aborting task.`);
+            execution.test.abort(`Task completed all ${DOCS_PER_TASK} inserts successfully!`);
+            return;
+        }
+        
+        // Generate batch using currentIdx
         for (let i = 0; i < batchSize; i++) {
-            const idx = baseIdx + i;
+            const idx = currentIdx + i;
             if (idx >= DOCS_PER_TASK) {
                 break;
             }
@@ -132,8 +176,21 @@ export default function () {
 
     const res = http.post(baseUrl, body, { headers: headers });
 
-    if (res.status !== 200) {
-        console.log(`Request failed with status ${res.status}`);
+    if (res.status === 200) {
+        if (mode === 'setup') {
+            // Only advance pointer on successful commit (HTTP 200)
+            currentIdx += batchSize;
+            if (currentIdx >= DOCS_PER_TASK) {
+                console.log(`Task index ${taskIndex} reached target ${DOCS_PER_TASK} successful inserts. Aborting.`);
+                execution.test.abort(`Task completed all ${DOCS_PER_TASK} inserts successfully!`);
+            }
+        }
+    } else {
+        console.log(`Request failed with status ${res.status}.`);
+        if (mode === 'setup') {
+            console.log(`Task index ${taskIndex}: Batch failed. Will retry index range ${currentIdx} to ${currentIdx + batchSize - 1}.`);
+            // We do NOT advance currentIdx, so it will retry in the next iteration.
+        }
     }
 }
 

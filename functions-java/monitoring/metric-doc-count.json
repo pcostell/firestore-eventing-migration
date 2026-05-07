@@ -1,0 +1,25 @@
+{
+  "name": "migration_doc_count",
+  "description": "Migrated document count aggregated from Cloud Function logs",
+  "filter": "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"firestore-migration-sink\" AND jsonPayload.message:\"MIGRATION_METRIC: doc_count\"",
+  "metricDescriptor": {
+    "metricKind": "DELTA",
+    "valueType": "INT64",
+    "labels": [
+      {
+        "key": "op",
+        "valueType": "STRING",
+        "description": "The Firestore operation"
+      },
+      {
+        "key": "source",
+        "valueType": "STRING",
+        "description": "The source identifier"
+      }
+    ]
+  },
+  "labelExtractors": {
+    "op": "REGEXP_EXTRACT(jsonPayload.message, \"op=(\\\\w+)\")",
+    "source": "REGEXP_EXTRACT(jsonPayload.message, \"source=(\\\\w+)\")"
+  }
+}
