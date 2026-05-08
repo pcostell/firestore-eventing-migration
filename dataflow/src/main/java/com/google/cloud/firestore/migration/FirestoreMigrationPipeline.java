@@ -2,6 +2,8 @@ package com.google.cloud.firestore.migration;
 
 import com.google.cloud.firestore.Firestore;
 import com.google.cloud.firestore.FirestoreOptions;
+import com.google.cloud.firestore.v1.FirestoreClient;
+import java.io.IOException;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.options.Description;
 import org.apache.beam.runners.dataflow.options.DataflowPipelineOptions;
@@ -64,7 +66,13 @@ public class FirestoreMigrationPipeline {
                       .addFrom(StructuredQuery.CollectionSelector.newBuilder()
                           .setCollectionId(coll.getId())
                           .setAllDescendants(true)
-                          .build()))
+                          .build())
+                                                  .addOrderBy(
+                            StructuredQuery.Order.newBuilder()
+                                .setField(
+                                    StructuredQuery.FieldReference.newBuilder().setFieldPath("__name__").build())
+                                .setDirection(StructuredQuery.Direction.ASCENDING)
+                                .build()))
                   .setPartitionCount(5000)
                   .build();
               c.output(request);
@@ -99,9 +107,12 @@ public class FirestoreMigrationPipeline {
   public static class WriteWithHWMFn extends DoFn<Document, Void> {
     private final String destProject;
     private final String destDatabase;
-    private transient Firestore db;
     private transient MigrationMetrics metrics;
     private transient FirestoreSink sink;
+    
+    // Bundle-level buffer for micro-batching
+    private transient java.util.List<FirestoreSink.Mutation> batchBuffer;
+    private static final int BATCH_SIZE = 100;
 
     public WriteWithHWMFn(String destProject, String destDatabase) {
       this.destProject = destProject;
@@ -110,18 +121,46 @@ public class FirestoreMigrationPipeline {
 
     @Setup
     public void setup() {
-      this.db = FirestoreOptions.newBuilder()
-          .setProjectId(destProject)
-          .setDatabaseId(destDatabase)
-          .build()
-          .getService();
-      this.metrics = new DataflowMetricsImpl("backfill");
-      this.sink = new FirestoreSink(db, metrics);
+      try {
+        FirestoreClient client = FirestoreClient.create();
+        this.metrics = new DataflowMetricsImpl("backfill");
+        this.sink = new FirestoreSink(client, metrics, destProject, destDatabase);
+      } catch (IOException e) {
+        throw new RuntimeException("Failed to create FirestoreClient", e);
+      }
+    }
+
+    @StartBundle
+    public void startBundle(StartBundleContext c) {
+      this.batchBuffer = new java.util.ArrayList<>();
     }
 
     @ProcessElement
     public void processElement(ProcessContext c) {
-      sink.process(c.element());
+      Document doc = c.element();
+      com.google.protobuf.Timestamp updateTime = doc.getUpdateTime();
+      com.google.cloud.Timestamp commitTime = com.google.cloud.Timestamp.ofTimeSecondsAndNanos(updateTime.getSeconds(), updateTime.getNanos());
+      batchBuffer.add(new FirestoreSink.Mutation(doc.getName(), commitTime, doc));
+      
+      if (batchBuffer.size() >= BATCH_SIZE) {
+        flushBatch();
+      }
+    }
+
+    @FinishBundle
+    public void finishBundle(FinishBundleContext c) {
+      flushBatch();
+    }
+
+    private void flushBatch() {
+      if (batchBuffer == null || batchBuffer.isEmpty()) {
+        return;
+      }
+      try {
+        sink.processBatch(batchBuffer);
+      } finally {
+        batchBuffer.clear();
+      }
     }
   }
 }

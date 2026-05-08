@@ -11,6 +11,8 @@ import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
+import com.google.api.gax.rpc.ApiException;
+import com.google.api.gax.rpc.ResourceExhaustedException;
 
 public class TrafficGeneratorApp implements HttpFunction {
     
@@ -87,15 +89,48 @@ public class TrafficGeneratorApp implements HttpFunction {
             count++;
         }
 
-        try {
-            batch.commit().get();
-            response.setStatusCode(200);
-            response.getWriter().write("OK processed " + count + " operations");
-        } catch (InterruptedException | ExecutionException e) {
-            System.err.println("ERROR writing to Firestore: " + e.getMessage());
-            e.printStackTrace(System.err);
-            response.setStatusCode(500);
-            response.getWriter().write("Error writing to Firestore: " + e.getMessage());
+        int maxRetries = 5;
+        long baseDelayMs = 1000;
+        int retries = 0;
+
+        while (true) {
+            try {
+                batch.commit().get();
+                response.setStatusCode(200);
+                response.getWriter().write("OK processed " + count + " operations");
+                break; // Success, exit loop
+            } catch (InterruptedException | ExecutionException e) {
+                Throwable cause = e.getCause();
+                boolean shouldRetry = false;
+                
+                if (cause instanceof ApiException) {
+                    ApiException apiException = (ApiException) cause;
+                    if (apiException.isRetryable() || apiException instanceof ResourceExhaustedException) {
+                        shouldRetry = true;
+                    }
+                }
+
+                if (shouldRetry && retries < maxRetries) {
+                    retries++;
+                    // Exponential backoff with jitter
+                    long delay = baseDelayMs * (long) Math.pow(2, retries) + (long) (Math.random() * 1000);
+                    System.err.println("Retryable error writing to Firestore (e.g., RESOURCE_EXHAUSTED). Retrying in " + delay + " ms (retry " + retries + "/" + maxRetries + ")... Error: " + cause.getMessage());
+                    try {
+                        Thread.sleep(delay);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        response.setStatusCode(500);
+                        response.getWriter().write("Interrupted during retry backoff: " + ie.getMessage());
+                        return;
+                    }
+                } else {
+                    System.err.println("ERROR writing to Firestore after " + retries + " retries: " + e.getMessage());
+                    e.printStackTrace(System.err);
+                    response.setStatusCode(500);
+                    response.getWriter().write("Error writing to Firestore: " + e.getMessage());
+                    break; // Fatal error or max retries exceeded, exit loop
+                }
+            }
         }
     }
 }

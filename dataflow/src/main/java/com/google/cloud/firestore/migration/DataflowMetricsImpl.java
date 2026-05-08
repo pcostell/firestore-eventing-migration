@@ -10,6 +10,7 @@ public class DataflowMetricsImpl implements MigrationMetrics {
     private final Counter noopWriteCounter;
     private final Counter noopDeleteCounter;
     private final Distribution lagDistribution;
+    private final Distribution potentialLagDistribution;
 
     public DataflowMetricsImpl(String source) {
         String namespace = "FirestoreMigration." + source;
@@ -18,6 +19,7 @@ public class DataflowMetricsImpl implements MigrationMetrics {
         this.noopWriteCounter = Metrics.counter(namespace, "doc_count_noop_write");
         this.noopDeleteCounter = Metrics.counter(namespace, "doc_count_noop_delete");
         this.lagDistribution = Metrics.distribution(namespace, "lag_ms");
+        this.potentialLagDistribution = Metrics.distribution(namespace, "potential_lag_ms");
     }
 
     @Override
@@ -33,5 +35,10 @@ public class DataflowMetricsImpl implements MigrationMetrics {
     @Override
     public void recordLag(long lagMillis) {
         lagDistribution.update(lagMillis);
+    }
+
+    @Override
+    public void recordPotentialLag(long lagMillis) {
+        potentialLagDistribution.update(lagMillis);
     }
 }

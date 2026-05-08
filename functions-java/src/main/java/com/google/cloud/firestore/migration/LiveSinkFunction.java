@@ -1,8 +1,8 @@
 package com.google.cloud.firestore.migration;
 
 import com.google.cloud.Timestamp;
-import com.google.cloud.firestore.Firestore;
-import com.google.cloud.firestore.FirestoreOptions;
+import com.google.cloud.firestore.v1.FirestoreClient;
+import java.io.IOException;
 import com.google.firestore.v1.Document;
 import com.google.protobuf.util.Timestamps;
 
@@ -15,25 +15,23 @@ import java.util.logging.Logger;
 public class LiveSinkFunction implements CloudEventsFunction {
   private static final Logger logger = Logger.getLogger(LiveSinkFunction.class.getName());
 
-  private final Firestore db;
   private final FirestoreSink sink;
 
   public LiveSinkFunction() {
     String destProject = System.getenv("DEST_PROJECT");
     String destDatabase = System.getenv("DEST_DB");
 
-    this.db = FirestoreOptions.newBuilder()
-        .setProjectId(destProject)
-        .setDatabaseId(destDatabase)
-        .build()
-        .getService();
-    MigrationMetrics metrics = new CloudFunctionMetrics("live", destProject);
-    this.sink = new FirestoreSink(db, metrics);
+    try {
+      FirestoreClient client = FirestoreClient.create();
+      MigrationMetrics metrics = new CloudFunctionMetrics("live", destProject);
+      this.sink = new FirestoreSink(client, metrics, destProject, destDatabase);
+    } catch (IOException e) {
+      throw new RuntimeException("Failed to create FirestoreClient", e);
+    }
   }
 
   // Visible for testing
-  LiveSinkFunction(Firestore db, FirestoreSink sink) {
-    this.db = db;
+  LiveSinkFunction(FirestoreSink sink) {
     this.sink = sink;
   }
 

@@ -24,4 +24,10 @@ public class CloudFunctionMetrics implements MigrationMetrics {
         // Log-based metric format: MIGRATION_METRIC: lag_ms source=<source> lag=<lag_ms>
         logger.info("MIGRATION_METRIC: lag_ms source=" + source + " lag=" + lagMillis);
     }
+
+    @Override
+    public void recordPotentialLag(long lagMillis) {
+        // Log-based metric format: MIGRATION_METRIC: potential_lag_ms source=<source> lag=<lag_ms>
+        logger.info("MIGRATION_METRIC: potential_lag_ms source=" + source + " lag=" + lagMillis);
+    }
 }

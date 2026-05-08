@@ -27,9 +27,6 @@ import static org.mockito.ArgumentMatchers.eq;
 public class LiveSinkFunctionTest {
 
     @Mock
-    private Firestore db;
-
-    @Mock
     private FirestoreSink sink;
 
     @Mock
@@ -42,7 +39,7 @@ public class LiveSinkFunctionTest {
 
     @Before
     public void setUp() {
-        function = new LiveSinkFunction(db, sink);
+        function = new LiveSinkFunction(sink);
     }
 
     @Test

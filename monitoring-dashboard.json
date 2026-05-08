@@ -48,17 +48,24 @@
         "width": 24,
         "widget": {
           "title": "Live Lag Time",
+          "id": "",
           "xyChart": {
             "chartOptions": {
               "displayHorizontal": false,
-              "mode": "COLOR"
+              "mode": "COLOR",
+              "showLegend": false
             },
             "dataSets": [
               {
+                "breakdowns": [],
+                "dimensions": [],
                 "legendTemplate": "Max Lag Time",
+                "measures": [],
                 "plotType": "LINE",
+                "sort": [],
                 "targetAxis": "Y1",
                 "timeSeriesQuery": {
+                  "outputFullDuration": false,
                   "prometheusQuery": "sum(increase(logging_googleapis_com:user_migration_lag_ms_sum{monitored_resource=\"cloud_run_revision\"}[1m])) / sum(increase(logging_googleapis_com:user_migration_lag_ms_count{monitored_resource=\"cloud_run_revision\"}[1m]))",
                   "unitOverride": "ms"
                 }
@@ -78,25 +85,17 @@
         "width": 24,
         "widget": {
           "title": "Backfilled Documents",
-          "id": "",
           "xyChart": {
             "chartOptions": {
               "displayHorizontal": false,
-              "mode": "COLOR",
-              "showLegend": false
+              "mode": "COLOR"
             },
             "dataSets": [
               {
-                "breakdowns": [],
-                "dimensions": [],
-                "legendTemplate": "",
-                "measures": [],
                 "minAlignmentPeriod": "60s",
                 "plotType": "LINE",
-                "sort": [],
                 "targetAxis": "Y1",
                 "timeSeriesQuery": {
-                  "outputFullDuration": false,
                   "timeSeriesFilter": {
                     "aggregation": {
                       "alignmentPeriod": "60s",
@@ -104,15 +103,29 @@
                       "groupByFields": [],
                       "perSeriesAligner": "ALIGN_MEAN"
                     },
-                    "filter": "metric.type=\"dataflow.googleapis.com/job/element_count\" resource.type=\"dataflow_job\" resource.label.\"job_name\"=monitoring.regex.full_match(\"firestoremigrationpipeline.*\")"
-                  },
-                  "unitOverride": ""
+                    "filter": "metric.type=\"custom.googleapis.com/dataflow/doc_count_write\" resource.type=\"dataflow_job\" resource.label.\"job_name\"=monitoring.regex.full_match(\"firestoremigrationpipeline.*\")"
+                  }
+                }
+              },
+              {
+                "minAlignmentPeriod": "60s",
+                "plotType": "LINE",
+                "targetAxis": "Y1",
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "aggregation": {
+                      "alignmentPeriod": "60s",
+                      "crossSeriesReducer": "REDUCE_SUM",
+                      "groupByFields": [],
+                      "perSeriesAligner": "ALIGN_MEAN"
+                    },
+                    "filter": "metric.type=\"custom.googleapis.com/dataflow/doc_count_noop_write\" resource.type=\"dataflow_job\" resource.label.\"job_name\"=monitoring.regex.full_match(\"firestoremigrationpipeline.*\")"
+                  }
                 }
               }
             ],
             "thresholds": [],
             "yAxis": {
-              "label": "",
               "scale": "LINEAR"
             }
           }

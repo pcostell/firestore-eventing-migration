@@ -10,10 +10,41 @@ if [ -z "$PROJECT_ID" ]; then
     exit 1
 fi
 
+# Parse arguments
+POPULATE_ONLY=false
+EXISTING_SOURCE_DB=""
+
+usage() {
+  echo "Usage: $0 [options]"
+  echo ""
+  echo "Options:"
+  echo "  --populate_only          Create and populate the source database, then exit."
+  echo "  --existing_source_db ID  Use an existing source database ID. Skips population."
+  echo "  --no_cleanup             Do not delete the databases at the end of the test."
+  exit 1
+}
+
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        --populate_only) POPULATE_ONLY=true ;;
+        --existing_source_db) EXISTING_SOURCE_DB="$2"; shift ;;
+        --no_cleanup) NO_CLEANUP=true ;;
+        -h|--help) usage ;;
+        *) echo "Unknown parameter passed: $1"; usage ;;
+    esac
+    shift
+done
+
 export SOURCE_PROJECT="$PROJECT_ID"
 export DEST_PROJECT="$PROJECT_ID"
 TIMESTAMP=$(date +%s)
-export SOURCE_DB="migration-test-src-$TIMESTAMP"
+
+if [ -n "$EXISTING_SOURCE_DB" ]; then
+    export SOURCE_DB="$EXISTING_SOURCE_DB"
+else
+    export SOURCE_DB="migration-test-src-$TIMESTAMP"
+fi
+
 export DEST_DB="migration-test-dst-$TIMESTAMP"
 export COLLECTION_NAME="load_test_data"
 
@@ -47,9 +78,19 @@ log_step_end() {
 
 step_create_databases() {
   local start=$(log_step_start "Create Databases")
-  echo "Creating Databases: $SOURCE_DB and $DEST_DB"
-  gcloud firestore databases create --project="$PROJECT_ID" --database="$SOURCE_DB" --type=firestore-native --location=us-central1 --quiet
-  gcloud firestore databases create --project="$PROJECT_ID" --database="$DEST_DB" --type=firestore-native --location=us-central1 --quiet
+  if [ -z "$EXISTING_SOURCE_DB" ]; then
+    echo "Creating Source Database: $SOURCE_DB"
+    gcloud firestore databases create --project="$PROJECT_ID" --database="$SOURCE_DB" --type=firestore-native --location=us-central1 --quiet
+  else
+    echo "Using existing source database: $SOURCE_DB"
+  fi
+  
+  if [ "$POPULATE_ONLY" = "false" ]; then
+    echo "Creating Destination Database: $DEST_DB"
+    gcloud firestore databases create --project="$PROJECT_ID" --database="$DEST_DB" --type=firestore-native --location=us-central1 --quiet
+  else
+    echo "Populate only mode: Skipping destination database creation."
+  fi
   log_step_end "Create Databases" "$start"
 }
 
@@ -181,7 +222,7 @@ step_start_traffic() {
 step_initiate_migration() {
   local start=$(log_step_start "Initiate Migration")
   echo "Initiating Migration Pipeline..."
-  NON_INTERACTIVE=true ./migrate.sh run --source-project "$SOURCE_PROJECT" --source-db "$SOURCE_DB" --dest-project "$DEST_PROJECT" --dest-db "$DEST_DB" --workers 10
+  NON_INTERACTIVE=true ./migrate.sh run --source-project "$SOURCE_PROJECT" --source-db "$SOURCE_DB" --dest-project "$DEST_PROJECT" --dest-db "$DEST_DB" --workers 50
   log_step_end "Initiate Migration" "$start"
 }
 
@@ -293,6 +334,7 @@ step_verification() {
   local start=$(log_step_start "Verification")
   (
     cd load-tests
+    mkdir -p ../output
     echo "Running Pass 1: Sharded Hashing on Cloud Dataflow..."
     mvn exec:java -Dexec.mainClass="com.google.cloud.firestore.migration.load.ParallelVerificationPipeline" \
       -Dexec.args="--runner=DataflowRunner \
@@ -306,20 +348,62 @@ step_verification() {
       --destProject=$DEST_PROJECT \
       --destDatabase=$DEST_DB \
       --collectionName=$COLLECTION_NAME \
-      --reportPath=gs://run-sources-pcostello-cloud-us-central1/dataflow/reports/detailed-diff-report-scale.txt"
+      --reportPath=gs://run-sources-pcostello-cloud-us-central1/dataflow/reports/detailed-diff-report.txt"
+    
+    # Safely download the unified GCS report locally to output directory
+    gcloud storage cp gs://run-sources-pcostello-cloud-us-central1/dataflow/reports/detailed-diff-report.txt ../output/detailed-diff-report.txt || true
   )
   log_step_end "Verification" "$start"
+}
+
+step_cleanup_databases() {
+  if [ "$NO_CLEANUP" = "true" ]; then
+    echo "Skipping database cleanup as --no_cleanup is specified."
+    return 0
+  fi
+  local start=$(log_step_start "Cleanup Databases")
+  if [ -z "$EXISTING_SOURCE_DB" ]; then
+    echo "Deleting Source Database: $SOURCE_DB"
+    gcloud firestore databases delete --project="$PROJECT_ID" --database="$SOURCE_DB" --quiet || echo "Warning: Failed to delete source DB $SOURCE_DB"
+  else
+    echo "Skipping deletion of existing source database: $SOURCE_DB"
+  fi
+  echo "Deleting Destination Database: $DEST_DB"
+  gcloud firestore databases delete --project="$PROJECT_ID" --database="$DEST_DB" --quiet || echo "Warning: Failed to delete destination DB $DEST_DB"
+  log_step_end "Cleanup Databases" "$start"
 }
 
 # --- Main Execution ---
 
 TOTAL_START=$(date +%s)
 
+if [ "$POPULATE_ONLY" = "true" ]; then
+  step_create_databases
+  step_build_artifacts
+  step_deploy_resources
+  step_load_initial_data
+  TOTAL_END=$(date +%s)
+  TOTAL_DUR=$((TOTAL_END - TOTAL_START))
+  TOTAL_MIN=$((TOTAL_DUR / 60))
+  TOTAL_SEC=$((TOTAL_DUR % 60))
+  echo "==========================================================="
+  echo "Population Complete in $TOTAL_MIN minutes and $TOTAL_SEC seconds."
+  echo "--populate_only specified, exiting without running tests or cleaning up."
+  echo "==========================================================="
+  exit 0
+fi
+
 step_create_databases
 step_build_artifacts
 step_deploy_resources
-step_start_traffic       # 1. Start background Live Traffic asynchronously (2K -> 10K QPS)
-step_load_initial_data   # 2. Start Data Loader (10K QPS flat) and WAIT (blocks until 100M docs are loaded)
+
+if [ -z "$EXISTING_SOURCE_DB" ]; then
+  step_start_traffic       # 1. Start background Live Traffic asynchronously (2K -> 10K QPS)
+  step_load_initial_data   # 2. Start Data Loader (10K QPS flat) and WAIT (blocks until 100M docs are loaded)
+else
+  step_start_traffic       # 1. Start background Live Traffic asynchronously (2K -> 10K QPS)
+fi
+
 step_initiate_migration  # 3. Deploy GCF Live Sink and start Dataflow backfill AFTER loader finishes
 step_wait_for_dataflow
 step_validate_metrics
@@ -327,6 +411,8 @@ step_run_lag_monitor
 step_stop_load_generator # 4. Stop background Live Traffic
 step_wait_for_propagation
 step_verification
+
+step_cleanup_databases
 
 TOTAL_END=$(date +%s)
 TOTAL_DUR=$((TOTAL_END - TOTAL_START))

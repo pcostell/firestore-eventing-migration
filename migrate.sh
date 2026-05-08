@@ -140,6 +140,11 @@ run_migration() {
         --project="$SOURCE_PROJECT" \
         --quiet || log "Warning: Could not create metric 'migration_lag_ms'. It may already exist."
 
+    gcloud logging metrics create migration_potential_lag_ms \
+        --config-from-file=functions-java/monitoring/metric-potential-lag-ms.json \
+        --project="$SOURCE_PROJECT" \
+        --quiet || log "Warning: Could not create metric 'migration_potential_lag_ms'. It may already exist."
+
     # Build fat jar locally
     log "Building Fat JAR..."
     mvn clean package -Pshade -pl functions-java -am -DskipTests -q || error "Failed to build fat jar."
@@ -191,6 +196,7 @@ run_migration() {
             --runner=DataflowRunner \
             --experiments=use_runner_v2 \
             --numWorkers=\"$WORKERS\" \
+            --maxNumWorkers=2000 \
             --region=us-central1"
     )
 
@@ -227,6 +233,11 @@ cleanup_migration() {
     if gcloud logging metrics describe migration_lag_ms --project="$SOURCE_PROJECT" &>/dev/null; then
         if confirm "Delete Log-Based Metric 'migration_lag_ms'?"; then
             gcloud logging metrics delete migration_lag_ms --project="$SOURCE_PROJECT" --quiet
+        fi
+    fi
+    if gcloud logging metrics describe migration_potential_lag_ms --project="$SOURCE_PROJECT" &>/dev/null; then
+        if confirm "Delete Log-Based Metric 'migration_potential_lag_ms'?"; then
+            gcloud logging metrics delete migration_potential_lag_ms --project="$SOURCE_PROJECT" --quiet
         fi
     fi
 

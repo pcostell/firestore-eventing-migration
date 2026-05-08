@@ -4,32 +4,23 @@ import com.google.firestore.v1.Document;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.io.TextIO;
 import org.apache.beam.sdk.io.gcp.firestore.FirestoreIO;
-import org.apache.beam.sdk.io.gcp.firestore.RpcQosOptions;
-import org.apache.beam.sdk.values.TypeDescriptors;
+import org.apache.beam.sdk.transforms.*;
+import org.apache.beam.sdk.transforms.join.CoGbkResult;
+import org.apache.beam.sdk.transforms.join.CoGroupByKey;
+import org.apache.beam.sdk.transforms.join.KeyedPCollectionTuple;
+import org.apache.beam.sdk.values.*;
 import org.apache.beam.sdk.options.Default;
 import org.apache.beam.sdk.options.Description;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.options.Validation.Required;
-import org.apache.beam.sdk.transforms.*;
-import org.apache.beam.sdk.transforms.join.CoGbkResult;
-import org.apache.beam.sdk.transforms.join.CoGroupByKey;
-import org.apache.beam.sdk.transforms.join.KeyedPCollectionTuple;
-import org.apache.beam.sdk.values.KV;
-import org.apache.beam.sdk.values.PCollection;
-import org.apache.beam.sdk.values.PCollectionList;
-import org.apache.beam.sdk.values.PCollectionView;
-import org.apache.beam.sdk.values.TupleTag;
 
 import java.math.BigInteger;
 import java.security.MessageDigest;
-import java.util.Arrays;
-import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.logging.Logger;
-import java.util.stream.Collectors;
 
 public class ParallelVerificationPipeline {
     private static final Logger LOG = Logger.getLogger(ParallelVerificationPipeline.class.getName());
@@ -72,100 +63,38 @@ public class ParallelVerificationPipeline {
         @Default.String("detailed-diff-report.txt")
         String getReportPath();
         void setReportPath(String value);
+
+        @Description("Read Timestamp (ISO-8601 format, e.g., 2026-05-08T00:00:00Z)")
+        String getReadTimestamp();
+        void setReadTimestamp(String value);
     }
 
     public static void main(String[] args) {
         VerificationOptions options = PipelineOptionsFactory.fromArgs(args).withValidation().as(VerificationOptions.class);
         String collection = (options.getCollectionName() != null) ? options.getCollectionName() : "test_data";
 
+        com.google.protobuf.Timestamp readTime = null;
+        if (options.getReadTimestamp() != null && !options.getReadTimestamp().isEmpty()) {
+            java.time.Instant instant = java.time.Instant.parse(options.getReadTimestamp());
+            readTime = com.google.protobuf.Timestamp.newBuilder()
+                    .setSeconds(instant.getEpochSecond())
+                    .setNanos(instant.getNano())
+                    .build();
+        }
+
         Pipeline p = Pipeline.create(options);
 
-        PCollection<Document> srcDocsRaw = readFirestore(p, options.getSourceProject(), options.getSourceDatabase(), collection, "Read Source DB");
-        PCollection<Document> dstDocsRaw = readFirestore(p, options.getDestProject(), options.getDestDatabase(), collection, "Read Dest DB");
+        PCollection<Document> srcDocsRaw = readFirestore(p, options.getSourceProject(), options.getSourceDatabase(), collection, "Read Source DB", readTime);
+        PCollection<Document> dstDocsRaw = readFirestore(p, options.getDestProject(), options.getDestDatabase(), collection, "Read Dest DB", readTime);
 
-        // 1. Run Hash Verification and get mismatching shards
-        PCollection<Integer> mismatchingShards = runHashVerification(srcDocsRaw, dstDocsRaw);
-
-        // Count total mismatching shards
-        PCollection<Long> mismatchCount = mismatchingShards.apply("Count Mismatches", Count.globally());
-
-        // 2. Sample up to 5 mismatching shards
-        PCollection<Iterable<Integer>> sampledShards = mismatchingShards.apply("Sample 5 Mismatches", Sample.fixedSizeGlobally(5));
-        PCollectionView<Iterable<Integer>> targetShardsView = sampledShards.apply("Create Target Shards View", View.asSingleton());
-
-        // 3. Filter docs by mismatching shards (using side input)
-        PCollection<Document> filteredSrcDocs = srcDocsRaw.apply("Filter Src Docs By Mismatch Shards",
-                ParDo.of(new FilterByShardsFn(targetShardsView)).withSideInputs(targetShardsView));
-
-        PCollection<Document> filteredDstDocs = dstDocsRaw.apply("Filter Dst Docs By Mismatch Shards",
-                ParDo.of(new FilterByShardsFn(targetShardsView)).withSideInputs(targetShardsView));
-
-        // 4. Run detailed diff on filtered docs (returns PCollection of result lines)
-        PCollection<String> diffResults = runDetailedDiff(filteredSrcDocs, filteredDstDocs);
-
-        // 5. Generate Warning Header if total mismatches > 5
-        PCollection<String> warningHeader = mismatchCount.apply("Generate Warning Header", ParDo.of(new DoFn<Long, String>() {
-            @ProcessElement
-            public void processElement(ProcessContext c) {
-                long count = c.element();
-                if (count > 5) {
-                    c.output("==================================================================");
-                    c.output("WARNING: ONLY A SAMPLE OF MISMATCHING SHARDS IS SHOWN BELOW!");
-                    c.output("Total mismatching shards: " + count + ". Only 5 were sampled for detailed diff.");
-                    c.output("==================================================================");
-                    c.output("");
-                }
-            }
-        }));
-
-        // 6. Flatten warning and diff results, then write to single file
-        PCollectionList<String> collections = PCollectionList.of(warningHeader).and(diffResults);
-        PCollection<String> mergedResults = collections.apply("Merge Results", Flatten.pCollections());
-
-        mergedResults.apply("Write Detailed Report", TextIO.write().to(options.getReportPath()).withoutSharding());
-
-        p.run().waitUntilFinish();
-    }
-
-    private static PCollection<Document> readFirestore(Pipeline p, String project, String dbId, String collection, String stepName) {
-        String parent = String.format("projects/%s/databases/%s/documents", project, dbId);
-
-        com.google.firestore.v1.StructuredQuery query = com.google.firestore.v1.StructuredQuery.newBuilder()
-                .addFrom(com.google.firestore.v1.StructuredQuery.CollectionSelector.newBuilder().setCollectionId(collection).setAllDescendants(true).build())
-                .build();
-
-        com.google.firestore.v1.PartitionQueryRequest request = com.google.firestore.v1.PartitionQueryRequest.newBuilder()
-                .setParent(parent)
-                .setStructuredQuery(query)
-                .setPartitionCount(100) // Adjust as needed
-                .build();
-
-        PCollection<com.google.firestore.v1.PartitionQueryRequest> requests = p.apply("Create Request " + stepName, org.apache.beam.sdk.transforms.Create.of(request));
-
-        PCollection<com.google.firestore.v1.RunQueryRequest> runQueryRequests = requests.apply("Partition " + stepName,
-                FirestoreIO.v1().read().partitionQuery().build());
-
-        PCollection<com.google.firestore.v1.RunQueryResponse> responses = runQueryRequests.apply("Run " + stepName,
-                FirestoreIO.v1().read().runQuery().build());
-
-        return responses.apply("Extract Doc " + stepName, ParDo.of(new DoFn<com.google.firestore.v1.RunQueryResponse, Document>() {
-            @ProcessElement
-            public void processElement(ProcessContext c) {
-                com.google.firestore.v1.RunQueryResponse resp = c.element();
-                if (resp.hasDocument()) {
-                    c.output(resp.getDocument());
-                }
-            }
-        }));
-    }
-
-    private static PCollection<Integer> runHashVerification(PCollection<Document> srcDocs, PCollection<Document> dstDocs) {
-        PCollection<KV<Integer, ShardMetrics>> srcShards = srcDocs.apply("Extract Source Shard Hash", ParDo.of(new ShardHashFn()))
+        // Extract Shards Metrics
+        PCollection<KV<Integer, ShardMetrics>> srcShards = srcDocsRaw.apply("Extract Source Shard Hash", ParDo.of(new ShardHashFn()))
                 .apply("Sum Source Shards", Combine.perKey(new ShardMetricsCombineFn()));
 
-        PCollection<KV<Integer, ShardMetrics>> dstShards = dstDocs.apply("Extract Dest Shard Hash", ParDo.of(new ShardHashFn()))
+        PCollection<KV<Integer, ShardMetrics>> dstShards = dstDocsRaw.apply("Extract Dest Shard Hash", ParDo.of(new ShardHashFn()))
                 .apply("Sum Dest Shards", Combine.perKey(new ShardMetricsCombineFn()));
 
+        // Join checksums
         final TupleTag<ShardMetrics> srcTag = new TupleTag<>();
         final TupleTag<ShardMetrics> dstTag = new TupleTag<>();
 
@@ -174,7 +103,27 @@ public class ParallelVerificationPipeline {
                 .and(dstTag, dstShards)
                 .apply("Join Shards Checksum", CoGroupByKey.create());
 
-        PCollection<Integer> mismatchingShardIds = joinedShards.apply("Compare Shard Checksums", ParDo.of(new DoFn<KV<Integer, CoGbkResult>, Integer>() {
+        // 1. Generate the complete sharded manifest breakdown
+        PCollection<String> shardBreakdown = joinedShards.apply("Format Shard Metrics Lines", ParDo.of(new DoFn<KV<Integer, CoGbkResult>, String>() {
+            @ProcessElement
+            public void processElement(ProcessContext c) {
+                int shardId = c.element().getKey();
+                CoGbkResult result = c.element().getValue();
+
+                ShardMetrics srcMetric = result.getOnly(srcTag, null);
+                ShardMetrics dstMetric = result.getOnly(dstTag, null);
+
+                long srcCount = (srcMetric != null) ? srcMetric.count : 0;
+                long dstCount = (dstMetric != null) ? dstMetric.count : 0;
+                String srcHash = (srcMetric != null) ? srcMetric.hash : "0";
+                String dstHash = (dstMetric != null) ? dstMetric.hash : "0";
+                boolean mismatch = srcCount != dstCount || !Objects.equals(srcHash, dstHash);
+
+                c.output(String.format("  - Shard %02d: SrcCount=%-8d DstCount=%-8d Mismatch=%b", shardId, srcCount, dstCount, mismatch));
+            }
+        }));
+
+        PCollection<Integer> mismatchingShards = joinedShards.apply("Compare Shard Checksums", ParDo.of(new DoFn<KV<Integer, CoGbkResult>, Integer>() {
             @ProcessElement
             public void processElement(ProcessContext c) {
                 int shardId = c.element().getKey();
@@ -189,26 +138,19 @@ public class ParallelVerificationPipeline {
                 String dstHash = (dstMetric != null) ? dstMetric.hash : "0";
 
                 if (srcCount != dstCount || !Objects.equals(srcHash, dstHash)) {
-                    LOG.severe(String.format("SHARD MISMATCH: ShardId=%d | SrcCount=%d DstCount=%d | HashMatch=%b",
-                            shardId, srcCount, dstCount, Objects.equals(srcHash, dstHash)));
                     c.output(shardId);
-                } else {
-                    LOG.info(String.format("SHARD MATCH: ShardId=%d | Count=%d | Hash=%s", shardId, srcCount, srcHash));
                 }
             }
         }));
 
-        // Add total count write to file
+        // Compute total counts (as side inputs)
         PCollection<Long> totalSrcCount = srcShards.apply("Extract Source Counts", ParDo.of(new DoFn<KV<Integer, ShardMetrics>, Long>() {
             @ProcessElement
             public void processElement(ProcessContext c) {
                 c.output(c.element().getValue().count);
             }
         })).apply("Sum Total Source Counts", Combine.globally(Sum.ofLongs()));
-
-        totalSrcCount.apply("Format Total Source Count", MapElements.into(TypeDescriptors.strings())
-                .via(count -> "TOTAL SOURCE DOC COUNT: " + count))
-           .apply("Write Total Source Count", TextIO.write().to("total-src-count.txt").withoutSharding());
+        PCollectionView<Long> totalSrcCountView = totalSrcCount.apply("Create Src View", View.asSingleton());
 
         PCollection<Long> totalDstCount = dstShards.apply("Extract Dest Counts", ParDo.of(new DoFn<KV<Integer, ShardMetrics>, Long>() {
             @ProcessElement
@@ -216,57 +158,130 @@ public class ParallelVerificationPipeline {
                 c.output(c.element().getValue().count);
             }
         })).apply("Sum Total Dest Counts", Combine.globally(Sum.ofLongs()));
+        PCollectionView<Long> totalDstCountView = totalDstCount.apply("Create Dst View", View.asSingleton());
 
-        totalDstCount.apply("Format Total Dest Count", MapElements.into(TypeDescriptors.strings())
-                .via(count -> "TOTAL DESTINATION DOC COUNT: " + count))
-           .apply("Write Total Dest Count", TextIO.write().to("total-dst-count.txt").withoutSharding());
+        PCollection<Long> mismatchCount = mismatchingShards.apply("Count Mismatches", Count.globally());
+        PCollectionView<Long> mismatchCountView = mismatchCount.apply("Create Mismatch View", View.asSingleton());
 
-        return mismatchingShardIds;
+        // Sample up to 5 mismatching shards for detailed diff
+        PCollection<Iterable<Integer>> sampledShards = mismatchingShards.apply("Sample 100 Mismatches", Sample.fixedSizeGlobally(100));
+        PCollectionView<Iterable<Integer>> targetShardsView = sampledShards.apply("Create Target Shards View", View.asSingleton());
+
+        // Filter docs by mismatching shards (using side input)
+        PCollection<Document> filteredSrcDocs = srcDocsRaw.apply("Filter Src Docs By Mismatch Shards",
+                ParDo.of(new FilterByShardsFn(targetShardsView)).withSideInputs(targetShardsView));
+
+        PCollection<Document> filteredDstDocs = dstDocsRaw.apply("Filter Dst Docs By Mismatch Shards",
+                ParDo.of(new FilterByShardsFn(targetShardsView)).withSideInputs(targetShardsView));
+
+        // Run detailed diff
+        PCollection<String> diffResults = runDetailedDiff(filteredSrcDocs, filteredDstDocs);
+
+        // Generate Unified Header
+        PCollection<String> unifiedHeader = p.apply("Create Header Trigger", Create.of(1L))
+                .apply("Generate Unified Summary Header", ParDo.of(new DoFn<Long, String>() {
+                    @ProcessElement
+                    public void processElement(ProcessContext c) {
+                        long srcTotal = c.sideInput(totalSrcCountView);
+                        long dstTotal = c.sideInput(totalDstCountView);
+                        long mismatches = c.sideInput(mismatchCountView);
+
+                        c.output("==================================================================");
+                        c.output("            MIGRATION LOAD TEST VERIFICATION REPORT               ");
+                        c.output("==================================================================");
+                        c.output(String.format("* Total Source Documents Examined      : %,d", srcTotal));
+                        c.output(String.format("* Total Destination Documents Examined : %,d", dstTotal));
+                        c.output(String.format("* Total Mismatching Shards             : %,d", mismatches));
+                        c.output("==================================================================");
+                        c.output("");
+                        c.output("------------------------------------------------------------------");
+                        c.output("                    COMPLETE SHARDED MANIFEST BREAKDOWN           ");
+                        c.output("------------------------------------------------------------------");
+                    }
+                }).withSideInputs(totalSrcCountView, totalDstCountView, mismatchCountView));
+
+        PCollection<String> unifiedFooter = p.apply("Create Footer Trigger", Create.of(1L))
+                .apply("Generate Detailed Diff Transition Lines", ParDo.of(new DoFn<Long, String>() {
+                    @ProcessElement
+                    public void processElement(ProcessContext c) {
+                        long mismatches = c.sideInput(mismatchCountView);
+                        c.output("------------------------------------------------------------------");
+                        c.output("");
+
+                        if (mismatches > 0) {
+                            c.output("==================================================================");
+                            c.output("              DETAILED MISMATCHING DOCUMENT SAMPLES              ");
+                            c.output("==================================================================");
+                            if (mismatches > 5) {
+                                c.output("WARNING: ONLY A SAMPLE OF MISMATCHING SHARDS IS SHOWN BELOW!");
+                                c.output("Total mismatching shards: " + mismatches + ". Only 5 were sampled for detailed diff.");
+                                c.output("==================================================================");
+                                c.output("");
+                            }
+                        }
+                    }
+                }).withSideInputs(mismatchCountView));
+
+        // Merge header, shard breakdown, separator, and detailed diff results
+        PCollectionList<String> collections = PCollectionList.of(unifiedHeader)
+                .and(shardBreakdown)
+                .and(unifiedFooter)
+                .and(diffResults);
+                
+        PCollection<String> mergedResults = collections.apply("Merge Results", Flatten.pCollections());
+
+        mergedResults.apply("Write Detailed Report", TextIO.write().to(options.getReportPath()).withoutSharding());
+
+        p.run().waitUntilFinish();
     }
 
-    private static void runDiffVerification(PCollection<Document> srcDocs, PCollection<Document> dstDocs, Set<Integer> targetShards) {
-        PCollection<KV<String, Document>> srcMapped = srcDocs
-                .apply("Filter Source Shards", Filter.by(doc -> targetShards == null || targetShards.contains(getShardId(doc))))
-                .apply("Map Source by ID", ParDo.of(new MapByIdFn()));
+    private static PCollection<Document> readFirestore(Pipeline p, String project, String dbId, String collection, String stepName, com.google.protobuf.Timestamp readTime) {
+        String parent = String.format("projects/%s/databases/%s/documents", project, dbId);
 
-        PCollection<KV<String, Document>> dstMapped = dstDocs
-                .apply("Filter Dest Shards", Filter.by(doc -> targetShards == null || targetShards.contains(getShardId(doc))))
-                .apply("Map Dest by ID", ParDo.of(new MapByIdFn()));
+        com.google.firestore.v1.StructuredQuery query = com.google.firestore.v1.StructuredQuery.newBuilder()
+                .addFrom(com.google.firestore.v1.StructuredQuery.CollectionSelector.newBuilder().setCollectionId(collection).setAllDescendants(true).build())
+                .addOrderBy(
+                        com.google.firestore.v1.StructuredQuery.Order.newBuilder()
+                                .setField(com.google.firestore.v1.StructuredQuery.FieldReference.newBuilder().setFieldPath("__name__").build())
+                                .setDirection(com.google.firestore.v1.StructuredQuery.Direction.ASCENDING)
+                                .build())
+                .build();
 
-        final TupleTag<Document> srcTag = new TupleTag<>();
-        final TupleTag<Document> dstTag = new TupleTag<>();
+        com.google.firestore.v1.PartitionQueryRequest.Builder requestBuilder = com.google.firestore.v1.PartitionQueryRequest.newBuilder()
+                .setParent(parent)
+                .setStructuredQuery(query)
+                .setPartitionCount(5000);
+                
+        if (readTime != null) {
+            requestBuilder.setReadTime(readTime);
+        }
 
-        PCollection<KV<String, CoGbkResult>> joined = KeyedPCollectionTuple
-                .of(srcTag, srcMapped)
-                .and(dstTag, dstMapped)
-                .apply("Join Docs", CoGroupByKey.create());
+        com.google.firestore.v1.PartitionQueryRequest request = requestBuilder.build();
 
-        joined.apply("Diff Docs", ParDo.of(new DoFn<KV<String, CoGbkResult>, Void>() {
+        PCollection<com.google.firestore.v1.PartitionQueryRequest> requests = p.apply("Create Request " + stepName, Create.of(request));
+
+        PCollection<com.google.firestore.v1.RunQueryRequest> runQueryRequests = requests.apply("Partition " + stepName,
+                org.apache.beam.sdk.io.gcp.firestore.FirestoreIO.v1().read().partitionQuery().build());
+
+        PCollection<com.google.firestore.v1.RunQueryResponse> responses = runQueryRequests.apply("Run " + stepName,
+                org.apache.beam.sdk.io.gcp.firestore.FirestoreIO.v1().read().runQuery().build());
+
+        return responses.apply("Extract Doc " + stepName, ParDo.of(new DoFn<com.google.firestore.v1.RunQueryResponse, Document>() {
             @ProcessElement
             public void processElement(ProcessContext c) {
-                String id = c.element().getKey();
-                CoGbkResult result = c.element().getValue();
-
-                Document src = result.getOnly(srcTag, null);
-                Document dst = result.getOnly(dstTag, null);
-
-                if (src == null && dst != null) {
-                    LOG.severe("DIFF MISMATCH: Doc found in Destination but NOT in Source. ID: " + id);
-                } else if (src != null && dst == null) {
-                    LOG.severe("DIFF MISMATCH: Doc found in Source but NOT in Destination. ID: " + id);
-                } else if (src != null && dst != null) {
-                    if (!src.getFieldsMap().equals(dst.getFieldsMap())) {
-                        LOG.severe("DIFF MISMATCH: Content mismatch for Doc ID: " + id);
-                    }
+                com.google.firestore.v1.RunQueryResponse resp = c.element();
+                if (resp.hasDocument()) {
+                    c.output(resp.getDocument());
                 }
             }
         }));
     }
 
-    private static int getShardId(Document doc) {
+    static int getShardId(Document doc) {
         String path = doc.getName();
-        String id = path.substring(path.lastIndexOf('/') + 1);
-        return Math.abs(id.hashCode() % 100);
+        int docIndex = path.indexOf("/documents/");
+        String relativePath = path.substring(docIndex + "/documents/".length());
+        return Math.abs(relativePath.hashCode() % 100);
     }
 
     private static class MapByIdFn extends DoFn<Document, KV<String, Document>> {
@@ -274,19 +289,27 @@ public class ParallelVerificationPipeline {
         public void processElement(ProcessContext c) {
             Document doc = c.element();
             String path = doc.getName();
-            String id = path.substring(path.lastIndexOf('/') + 1);
-            c.output(KV.of(id, doc));
+            int docIndex = path.indexOf("/documents/");
+            String relativePath = path.substring(docIndex + "/documents/".length());
+            c.output(KV.of(relativePath, doc));
         }
     }
 
     public static BigInteger hashContent(Document doc) {
         try {
             MessageDigest md = MessageDigest.getInstance("SHA-256");
-            TreeMap<String, String> sortedFields = new TreeMap<>();
-            doc.getFieldsMap().forEach((k, v) -> sortedFields.put(k, v.toString()));
+            TreeMap<String, com.google.firestore.v1.Value> sortedFields = new TreeMap<>(doc.getFieldsMap());
             
-            String canonical = sortedFields.toString();
-            byte[] bytes = md.digest(canonical.getBytes());
+            for (java.util.Map.Entry<String, com.google.firestore.v1.Value> entry : sortedFields.entrySet()) {
+                md.update(entry.getKey().getBytes());
+                int h = entry.getValue().hashCode();
+                md.update((byte)(h >>> 24));
+                md.update((byte)(h >>> 16));
+                md.update((byte)(h >>> 8));
+                md.update((byte)h);
+            }
+            
+            byte[] bytes = md.digest();
             return new BigInteger(1, bytes);
         } catch (Exception e) {
             return BigInteger.ZERO;
@@ -299,7 +322,6 @@ public class ParallelVerificationPipeline {
             Document doc = c.element();
             int shardId = getShardId(doc);
             
-            // Hash content
             BigInteger hash = hashContent(doc);
             c.output(KV.of(shardId, KV.of(1L, hash)));
         }
@@ -307,8 +329,10 @@ public class ParallelVerificationPipeline {
 
     public static class DocInfo implements java.io.Serializable {
         public String hash;
-        public DocInfo(String hash) {
+        public Document doc;
+        public DocInfo(String hash, Document doc) {
             this.hash = hash;
+            this.doc = doc;
         }
     }
 
@@ -317,9 +341,10 @@ public class ParallelVerificationPipeline {
         public void processElement(ProcessContext c) {
             Document doc = c.element();
             String path = doc.getName();
-            String id = path.substring(path.lastIndexOf('/') + 1);
+            int docIndex = path.indexOf("/documents/");
+            String relativePath = path.substring(docIndex + "/documents/".length());
             String hash = hashContent(doc).toString(16);
-            c.output(KV.of(id, new DocInfo(hash)));
+            c.output(KV.of(relativePath, new DocInfo(hash, doc)));
         }
     }
 
@@ -366,19 +391,19 @@ public class ParallelVerificationPipeline {
         return joined.apply("Diff Filtered Docs", ParDo.of(new DoFn<KV<String, CoGbkResult>, String>() {
             @ProcessElement
             public void processElement(ProcessContext c) {
-                String id = c.element().getKey();
+                String path = c.element().getKey();
                 CoGbkResult result = c.element().getValue();
 
                 DocInfo src = result.getOnly(srcTag, null);
                 DocInfo dst = result.getOnly(dstTag, null);
 
                 if (src == null && dst != null) {
-                    c.output("EXTRA: " + id + " | DestHash=" + dst.hash);
+                    c.output("EXTRA: " + path + " | DestHash=" + dst.hash);
                 } else if (src != null && dst == null) {
-                    c.output("MISSING: " + id + " | SrcHash=" + src.hash);
+                    c.output("MISSING: " + path + " | SrcHash=" + src.hash);
                 } else if (src != null && dst != null) {
-                    if (!Objects.equals(src.hash, dst.hash)) {
-                        c.output("MISMATCH: " + id + " | SrcHash=" + src.hash + " DstHash=" + dst.hash);
+                    if (!src.doc.getFieldsMap().equals(dst.doc.getFieldsMap())) {
+                        c.output("MISMATCH: " + path + " | Fields differ");
                     }
                 }
             }

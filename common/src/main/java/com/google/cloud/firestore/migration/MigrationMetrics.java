@@ -10,4 +10,5 @@ public interface MigrationMetrics {
 
     void recordOperation(Operation op);
     void recordLag(long lagMillis);
+    void recordPotentialLag(long lagMillis);
 }
