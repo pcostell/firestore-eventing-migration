@@ -170,6 +170,7 @@ run_migration() {
         --set-env-vars="DEST_PROJECT=$DEST_PROJECT,DEST_DB=$DEST_DB" \
         --region=us-central1 \
         --gen2 --quiet \
+        --retry \
         --concurrency=50 \
         --max-instances=250 \
         --cpu=4 \

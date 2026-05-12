@@ -295,6 +295,67 @@ public class ParallelVerificationPipeline {
         }
     }
 
+    public static void hashLogicalValue(MessageDigest md, com.google.firestore.v1.Value value) {
+        switch (value.getValueTypeCase()) {
+            case STRING_VALUE:
+                md.update((byte) 1);
+                md.update(value.getStringValue().getBytes());
+                break;
+            case INTEGER_VALUE:
+                md.update((byte) 2);
+                long iv = value.getIntegerValue();
+                md.update(java.nio.ByteBuffer.allocate(8).putLong(iv).array());
+                break;
+            case DOUBLE_VALUE:
+                md.update((byte) 3);
+                double dv = value.getDoubleValue();
+                md.update(java.nio.ByteBuffer.allocate(8).putDouble(dv).array());
+                break;
+            case BOOLEAN_VALUE:
+                md.update((byte) 4);
+                md.update((byte) (value.getBooleanValue() ? 1 : 0));
+                break;
+            case TIMESTAMP_VALUE:
+                md.update((byte) 5);
+                md.update(java.nio.ByteBuffer.allocate(8).putLong(value.getTimestampValue().getSeconds()).array());
+                md.update(java.nio.ByteBuffer.allocate(4).putInt(value.getTimestampValue().getNanos()).array());
+                break;
+            case NULL_VALUE:
+                md.update((byte) 6);
+                break;
+            case REFERENCE_VALUE:
+                md.update((byte) 7);
+                md.update(value.getReferenceValue().getBytes());
+                break;
+            case GEO_POINT_VALUE:
+                md.update((byte) 8);
+                md.update(java.nio.ByteBuffer.allocate(8).putDouble(value.getGeoPointValue().getLatitude()).array());
+                md.update(java.nio.ByteBuffer.allocate(8).putDouble(value.getGeoPointValue().getLongitude()).array());
+                break;
+            case ARRAY_VALUE:
+                md.update((byte) 9);
+                for (com.google.firestore.v1.Value v : value.getArrayValue().getValuesList()) {
+                    hashLogicalValue(md, v);
+                }
+                break;
+            case MAP_VALUE:
+                md.update((byte) 10);
+                java.util.TreeMap<String, com.google.firestore.v1.Value> sortedMap = new java.util.TreeMap<>(value.getMapValue().getFieldsMap());
+                for (java.util.Map.Entry<String, com.google.firestore.v1.Value> entry : sortedMap.entrySet()) {
+                    md.update(entry.getKey().getBytes());
+                    hashLogicalValue(md, entry.getValue());
+                }
+                break;
+            case BYTES_VALUE:
+                md.update((byte) 11);
+                md.update(value.getBytesValue().toByteArray());
+                break;
+            case VALUETYPE_NOT_SET:
+                md.update((byte) 0);
+                break;
+        }
+    }
+
     public static BigInteger hashContent(Document doc) {
         try {
             MessageDigest md = MessageDigest.getInstance("SHA-256");
@@ -302,11 +363,7 @@ public class ParallelVerificationPipeline {
             
             for (java.util.Map.Entry<String, com.google.firestore.v1.Value> entry : sortedFields.entrySet()) {
                 md.update(entry.getKey().getBytes());
-                int h = entry.getValue().hashCode();
-                md.update((byte)(h >>> 24));
-                md.update((byte)(h >>> 16));
-                md.update((byte)(h >>> 8));
-                md.update((byte)h);
+                hashLogicalValue(md, entry.getValue());
             }
             
             byte[] bytes = md.digest();

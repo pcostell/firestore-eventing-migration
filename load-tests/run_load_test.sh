@@ -401,7 +401,7 @@ if [ -z "$EXISTING_SOURCE_DB" ]; then
   step_start_traffic       # 1. Start background Live Traffic asynchronously (2K -> 10K QPS)
   step_load_initial_data   # 2. Start Data Loader (10K QPS flat) and WAIT (blocks until 100M docs are loaded)
 else
-  step_start_traffic       # 1. Start background Live Traffic asynchronously (2K -> 10K QPS)
+  step_start_traffic &
 fi
 
 step_initiate_migration  # 3. Deploy GCF Live Sink and start Dataflow backfill AFTER loader finishes
