@@ -24,6 +24,7 @@ import com.google.protobuf.util.Timestamps;
 
 import io.cloudevents.CloudEvent;
 import com.google.cloud.functions.CloudEventsFunction;
+import java.time.Instant;
 import java.time.OffsetDateTime;
 
 import java.util.logging.Logger;
@@ -32,14 +33,28 @@ public class LiveSinkFunction implements CloudEventsFunction {
   private static final Logger logger = Logger.getLogger(LiveSinkFunction.class.getName());
 
   private final FirestoreSink sink;
+  private final MigrationMetrics metrics;
+  private final Instant syncStart;
 
   public LiveSinkFunction() {
     String destProject = System.getenv("DEST_PROJECT");
     String destDatabase = System.getenv("DEST_DB");
+    String syncStartEnv = System.getenv("SYNC_START");
+
+    this.metrics = new CloudFunctionMetrics("live", destProject);
+    if (syncStartEnv != null && !syncStartEnv.isEmpty()) {
+      try {
+        this.syncStart = Instant.parse(syncStartEnv);
+      } catch (Exception e) {
+        logger.severe("Invalid SYNC_START environment variable: " + syncStartEnv);
+        throw new RuntimeException("Invalid SYNC_START format", e);
+      }
+    } else {
+      this.syncStart = null;
+    }
 
     try {
       FirestoreClient client = FirestoreClient.create();
-      MigrationMetrics metrics = new CloudFunctionMetrics("live", destProject);
       this.sink = new FirestoreSink(client, metrics, destProject, destDatabase);
     } catch (IOException e) {
       throw new RuntimeException("Failed to create FirestoreClient", e);
@@ -49,6 +64,19 @@ public class LiveSinkFunction implements CloudEventsFunction {
   // Visible for testing
   LiveSinkFunction(FirestoreSink sink) {
     this.sink = sink;
+    this.metrics = new CloudFunctionMetrics("live", "test-project");
+    this.syncStart = Instant.MIN;
+  }
+
+  // Visible for testing
+  LiveSinkFunction(FirestoreSink sink, MigrationMetrics metrics, String syncStartEnv) {
+    this.sink = sink;
+    this.metrics = metrics;
+    if (syncStartEnv != null && !syncStartEnv.isEmpty()) {
+      this.syncStart = Instant.parse(syncStartEnv);
+    } else {
+      this.syncStart = null;
+    }
   }
 
   @Override
@@ -60,6 +88,20 @@ public class LiveSinkFunction implements CloudEventsFunction {
       logger.severe("Fatal: CloudEvent time attribute is missing!");
       throw new RuntimeException("CloudEvent time attribute is missing");
     }
+
+    if (syncStart == null) {
+      logger.info("SYNC_START is not set. Discarding event as NOOP_TIMEDELAY.");
+      metrics.recordOperation(MigrationMetrics.Operation.NOOP_TIMEDELAY);
+      return;
+    }
+
+    Instant eventInstant = odt.toInstant();
+    if (!eventInstant.isAfter(syncStart)) {
+      logger.info("Event commit time " + eventInstant + " is not after SYNC_START " + syncStart + ". Discarding as NOOP_TIMEDELAY.");
+      metrics.recordOperation(MigrationMetrics.Operation.NOOP_TIMEDELAY);
+      return;
+    }
+
     Timestamp commitTime = Timestamp.ofTimeSecondsAndNanos(odt.toEpochSecond(), odt.getNano());
 
     if (event.getData() == null) {

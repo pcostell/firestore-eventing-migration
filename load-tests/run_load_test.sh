@@ -28,6 +28,7 @@ fi
 # Parse arguments
 POPULATE_ONLY=false
 EXISTING_SOURCE_DB=""
+DEST_LOCATION="us-central1"
 
 usage() {
   echo "Usage: $0 [options]"
@@ -36,6 +37,7 @@ usage() {
   echo "  --populate_only          Create and populate the source database, then exit."
   echo "  --existing_source_db ID  Use an existing source database ID. Skips population."
   echo "  --no_cleanup             Do not delete the databases at the end of the test."
+  echo "  --dest_location LOC      Location for the destination database (default: us-central1)."
   exit 1
 }
 
@@ -44,6 +46,7 @@ while [[ "$#" -gt 0 ]]; do
         --populate_only) POPULATE_ONLY=true ;;
         --existing_source_db) EXISTING_SOURCE_DB="$2"; shift ;;
         --no_cleanup) NO_CLEANUP=true ;;
+        --dest_location) DEST_LOCATION="$2"; shift ;;
         -h|--help) usage ;;
         *) echo "Unknown parameter passed: $1"; usage ;;
     esac
@@ -101,8 +104,8 @@ step_create_databases() {
   fi
   
   if [ "$POPULATE_ONLY" = "false" ]; then
-    echo "Creating Destination Database: $DEST_DB"
-    gcloud firestore databases create --project="$PROJECT_ID" --database="$DEST_DB" --type=firestore-native --location=us-central1 --quiet
+    echo "Creating Destination Database: $DEST_DB (Location: $DEST_LOCATION)"
+    gcloud firestore databases create --project="$PROJECT_ID" --database="$DEST_DB" --type=firestore-native --location="$DEST_LOCATION" --quiet
   else
     echo "Populate only mode: Skipping destination database creation."
   fi
@@ -355,18 +358,18 @@ step_verification() {
       -Dexec.args="--runner=DataflowRunner \
       --project=$PROJECT_ID \
       --region=us-central1 \
-      --tempLocation=gs://run-sources-pcostello-cloud-us-central1/dataflow/temp \
-      --gcpTempLocation=gs://run-sources-pcostello-cloud-us-central1/dataflow/gcp-temp \
-      --stagingLocation=gs://run-sources-pcostello-cloud-us-central1/dataflow/staging \
+      --tempLocation=gs://run-sources-${PROJECT_ID}-us-central1/dataflow/temp \
+      --gcpTempLocation=gs://run-sources-${PROJECT_ID}-us-central1/dataflow/gcp-temp \
+      --stagingLocation=gs://run-sources-${PROJECT_ID}-us-central1/dataflow/staging \
       --sourceProject=$SOURCE_PROJECT \
       --sourceDatabase=$SOURCE_DB \
       --destProject=$DEST_PROJECT \
       --destDatabase=$DEST_DB \
       --collectionName=$COLLECTION_NAME \
-      --reportPath=gs://run-sources-pcostello-cloud-us-central1/dataflow/reports/detailed-diff-report.txt"
+      --reportPath=gs://run-sources-${PROJECT_ID}-us-central1/dataflow/reports/detailed-diff-report.txt"
     
     # Safely download the unified GCS report locally to output directory
-    gcloud storage cp gs://run-sources-pcostello-cloud-us-central1/dataflow/reports/detailed-diff-report.txt ../output/detailed-diff-report.txt || true
+    gcloud storage cp gs://run-sources-${PROJECT_ID}-us-central1/dataflow/reports/detailed-diff-report.txt ../output/detailed-diff-report.txt || true
   )
   log_step_end "Verification" "$start"
 }

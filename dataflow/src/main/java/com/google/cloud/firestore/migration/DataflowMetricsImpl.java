@@ -25,6 +25,7 @@ public class DataflowMetricsImpl implements MigrationMetrics {
     private final Counter deleteCounter;
     private final Counter noopWriteCounter;
     private final Counter noopDeleteCounter;
+    private final Counter noopTimeDelayCounter;
     private final Distribution lagDistribution;
     private final Distribution potentialLagDistribution;
 
@@ -34,6 +35,7 @@ public class DataflowMetricsImpl implements MigrationMetrics {
         this.deleteCounter = Metrics.counter(namespace, "doc_count_delete");
         this.noopWriteCounter = Metrics.counter(namespace, "doc_count_noop_write");
         this.noopDeleteCounter = Metrics.counter(namespace, "doc_count_noop_delete");
+        this.noopTimeDelayCounter = Metrics.counter(namespace, "doc_count_noop_time_delay");
         this.lagDistribution = Metrics.distribution(namespace, "lag_ms");
         this.potentialLagDistribution = Metrics.distribution(namespace, "potential_lag_ms");
     }
@@ -45,6 +47,7 @@ public class DataflowMetricsImpl implements MigrationMetrics {
             case DELETE: deleteCounter.inc(); break;
             case NOOP_WRITE: noopWriteCounter.inc(); break;
             case NOOP_DELETE: noopDeleteCounter.inc(); break;
+            case NOOP_TIMEDELAY: noopTimeDelayCounter.inc(); break;
         }
     }
 

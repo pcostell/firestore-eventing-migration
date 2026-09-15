@@ -21,7 +21,8 @@ public interface MigrationMetrics {
         WRITE,
         DELETE,
         NOOP_WRITE,
-        NOOP_DELETE
+        NOOP_DELETE,
+        NOOP_TIMEDELAY
     }
 
     void recordOperation(Operation op);

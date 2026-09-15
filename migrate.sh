@@ -172,10 +172,6 @@ run_migration() {
     # 3. Deploy Live Stream Sink (Cloud Function) from Fat JAR
     log "Deploying Live Journal Sink (Cloud Function) from Fat JAR..."
     
-    CURRENT_PROJECT=$(gcloud config get-value project 2>/dev/null || echo "pcostello-cloud")
-    log "Setting gcloud project to $SOURCE_PROJECT for deployment (was $CURRENT_PROJECT)"
-    gcloud config set project "$SOURCE_PROJECT" --quiet
-    
     gcloud functions deploy firestore-migration-sink \
         --project="$SOURCE_PROJECT" \
         --runtime=java17 \
@@ -192,29 +188,41 @@ run_migration() {
         --memory=4Gi
 
     rm -rf "$STAGING_DIR"
-    
-    log "Restoring gcloud project to $CURRENT_PROJECT"
-    gcloud config set project "$CURRENT_PROJECT" --quiet
 
-    log "Live Sink deployed. Waiting 10 minutes for Eventarc propagation and write-catching..."
-    sleep 600
+    # Calculate SYNC_START timestamp (10 minutes in the future)
+    SYNC_START=$(date -u -d '+10 minutes' +'%Y-%m-%dT%H:%M:%SZ')
+    log "Picked SYNC_START timestamp: $SYNC_START (10 minutes in the future)"
+
+    log "Performing fast environment variable push to Cloud Function..."
+    gcloud run services update firestore-migration-sink \
+        --project="$SOURCE_PROJECT" \
+        --region=us-central1 \
+        --update-env-vars="SYNC_START=$SYNC_START" \
+        --quiet
+
+    log "Waiting until 2 minutes after SYNC_START before starting backfill..."
+    NOW_SEC=$(date +%s)
+    SYNC_START_SEC=$(date -d "$SYNC_START" +%s)
+    TARGET_SEC=$((SYNC_START_SEC + 120))
+    SLEEP_SEC=$((TARGET_SEC - NOW_SEC))
+    if [[ $SLEEP_SEC -gt 0 ]]; then
+        sleep $SLEEP_SEC
+    fi
 
     # 4. Start Dataflow Backfill
     log "Running Dataflow Backfill using exec:java..."
-    (
-        cd dataflow
-        mvn compile exec:java -Dexec.mainClass="com.google.cloud.firestore.migration.FirestoreMigrationPipeline" \
-            -Dexec.args="--project=\"$DEST_PROJECT\" \
-            --sourceProject=\"$SOURCE_PROJECT\" \
-            --sourceDatabase=\"$SOURCE_DB\" \
-            --destinationProject=\"$DEST_PROJECT\" \
-            --destinationDatabase=\"$DEST_DB\" \
-            --runner=DataflowRunner \
-            --experiments=use_runner_v2 \
-            --numWorkers=\"$WORKERS\" \
-            --maxNumWorkers=2000 \
-            --region=us-central1"
-    )
+    mvn compile exec:java -pl dataflow -am \
+        -Dexec.mainClass="com.google.cloud.firestore.migration.FirestoreMigrationPipeline" \
+        -Dexec.args="--project=\"$DEST_PROJECT\" \
+        --sourceProject=\"$SOURCE_PROJECT\" \
+        --sourceDatabase=\"$SOURCE_DB\" \
+        --destinationProject=\"$DEST_PROJECT\" \
+        --destinationDatabase=\"$DEST_DB\" \
+        --runner=DataflowRunner \
+        --experiments=use_runner_v2 \
+        --numWorkers=\"$WORKERS\" \
+        --maxNumWorkers=2000 \
+        --region=us-central1"
 
     log "Migration run initiated successfully. Monitor the Dataflow job in the Cloud Console."
 }

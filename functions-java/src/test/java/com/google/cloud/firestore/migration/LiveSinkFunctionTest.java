@@ -116,4 +116,33 @@ public class LiveSinkFunctionTest {
             org.mockito.ArgumentMatchers.isNull()
         );
     }
+
+    @Mock
+    private MigrationMetrics metrics;
+
+    @Test
+    public void testAcceptUnsetSyncStart() throws Exception {
+        LiveSinkFunction customFunction = new LiveSinkFunction(sink, metrics, null);
+        OffsetDateTime eventTime = OffsetDateTime.ofInstant(Instant.ofEpochSecond(1000), ZoneOffset.UTC);
+        when(cloudEvent.getTime()).thenReturn(eventTime);
+        when(cloudEvent.getType()).thenReturn("google.cloud.firestore.document.v1.written");
+
+        customFunction.accept(cloudEvent);
+
+        verify(metrics).recordOperation(MigrationMetrics.Operation.NOOP_TIMEDELAY);
+        org.mockito.Mockito.verifyNoInteractions(sink);
+    }
+
+    @Test
+    public void testAcceptBeforeSyncStart() throws Exception {
+        LiveSinkFunction customFunction = new LiveSinkFunction(sink, metrics, "2026-05-29T20:45:00Z");
+        OffsetDateTime eventTime = OffsetDateTime.parse("2026-05-29T20:40:00Z");
+        when(cloudEvent.getTime()).thenReturn(eventTime);
+        when(cloudEvent.getType()).thenReturn("google.cloud.firestore.document.v1.written");
+
+        customFunction.accept(cloudEvent);
+
+        verify(metrics).recordOperation(MigrationMetrics.Operation.NOOP_TIMEDELAY);
+        org.mockito.Mockito.verifyNoInteractions(sink);
+    }
 }
