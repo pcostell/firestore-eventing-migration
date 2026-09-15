@@ -1,0 +1,68 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Auto-Prune Customer Access
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate GitHub App Token
+        id: generate_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      - name: Check Expiry Date
+        id: check_expiry
+        run: |
+          EXPIRY_DATE=$(jq -r '.expiry_date' METADATA.json)
+          TODAY=$(date +%Y-%m-%d)
+          if [[ "$TODAY" > "$EXPIRY_DATE" || "$TODAY" == "$EXPIRY_DATE" ]]; then
+            echo "Access expired. Proceeding to prune."
+            echo "EXPIRED=true" >> $GITHUB_ENV
+          else
+            echo "Access is still valid (Expires: $EXPIRY_DATE)."
+            echo "EXPIRED=false" >> $GITHUB_ENV
+          fi
+      - name: Remove Customer Access
+        if: env.EXPIRED == 'true'
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        run: |
+          # Read handles as an array from METADATA.json
+          HANDLES=$(jq -r '.customer_handles[]' METADATA.json)
+          for handle in $HANDLES; do
+            echo "Removing access for $handle..."
+            # Remove active collaborator
+            gh api -X DELETE /repos/${{ github.repository }}/collaborators/$handle || true
+            
+            # Check for and remove pending invitations
+            INVITE_ID=$(gh api /repos/${{ github.repository }}/invitations -q ".[] | select(.invitee.login == \"$handle\") | .id")
+            if [[ -n "$INVITE_ID" ]]; then
+              gh api -X DELETE /repos/${{ github.repository }}/invitations/$INVITE_ID
+            fi
+          done
+      - name: Audit Log (Issue)
+        if: env.EXPIRED == 'true'
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        run: |
+          HANDLES_MENTION=$(jq -r '"@" + (.customer_handles | join(", @"))' METADATA.json)
+          gh issue create --title "Access Revoked" --body "Automatic 30-day access revocation complete for $HANDLES_MENTION."

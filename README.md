@@ -1,5 +1,8 @@
 # Firestore Shadow-Journal Migration Tool
 
+## Access Notice
+Access is temporary (30 days). Ensure you have cloned the content before 2026-06-20.
+
 This tool provides a robust, online migration path between two Firestore databases (Standard or Enterprise). It ensures data correctness through a distributed **High Water Mark (HWM)** synchronization pattern, allowing for a live cutover without requiring Point-in-Time Recovery (PITR).
 
 ## Architecture
