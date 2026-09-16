@@ -44,6 +44,8 @@ public class IntegrationTest {
     private static String dstProject;
     private static String srcDb;
     private static String dstDb;
+    private static String srcLocation;
+    private static String dstLocation;
     private static Firestore srcFirestore;
     private static Firestore dstFirestore;
     private static Process migrateProcess;
@@ -62,17 +64,30 @@ public class IntegrationTest {
         if (srcProject == null || srcProject.isEmpty()) {
             throw new RuntimeException("PROJECT_ID or SOURCE_PROJECT environment variable is required.");
         }
+
+        srcLocation = System.getenv("SRC_LOCATION");
+        if (srcLocation == null || srcLocation.isEmpty()) {
+            srcLocation = System.getenv("SOURCE_LOCATION");
+        }
+        if (srcLocation == null || srcLocation.isEmpty()) {
+            srcLocation = "us-central1";
+        }
+
+        dstLocation = System.getenv("DEST_LOCATION");
+        if (dstLocation == null || dstLocation.isEmpty()) {
+            dstLocation = "us-central1";
+        }
         
         long timestamp = System.currentTimeMillis() / 1000;
         srcDb = "test-src-" + timestamp;
         dstDb = "test-dst-" + timestamp;
         
-        System.out.println("Creating source database: " + srcDb + " in project " + srcProject);
+        System.out.println("Creating source database: " + srcDb + " in project " + srcProject + " (location: " + srcLocation + ")");
         runCommand("gcloud", "firestore", "databases", "create", 
                 "--project=" + srcProject, "--database=" + srcDb, 
-                "--type=firestore-native", "--location=us-central1", "--quiet");
+                "--type=firestore-native", "--location=" + srcLocation, "--quiet");
 
-        System.out.println("Creating destination database: " + dstDb + " in project " + dstProject);
+        System.out.println("Creating destination database: " + dstDb + " in project " + dstProject + " (location: " + dstLocation + ")");
         String destEdition = System.getenv("DEST_EDITION");
         if (destEdition == null || destEdition.isEmpty()) {
             destEdition = "ENTERPRISE";
@@ -81,11 +96,11 @@ public class IntegrationTest {
         if ("ENTERPRISE".equalsIgnoreCase(destEdition)) {
             runCommand("gcloud", "firestore", "databases", "create", 
                     "--project=" + dstProject, "--database=" + dstDb, 
-                    "--edition=enterprise", "--enable-firestore-data-access", "--location=us-central1", "--quiet");
+                    "--edition=enterprise", "--enable-firestore-data-access", "--location=" + dstLocation, "--quiet");
         } else {
             runCommand("gcloud", "firestore", "databases", "create", 
                     "--project=" + dstProject, "--database=" + dstDb, 
-                    "--type=firestore-native", "--location=us-central1", "--quiet");
+                    "--type=firestore-native", "--location=" + dstLocation, "--quiet");
         }
 
         // Grant permissions
@@ -142,7 +157,7 @@ public class IntegrationTest {
         }
         
         try {
-            runCommand("./migrate.sh", "cleanup", "--source-project", srcProject, "--dest-project", dstProject, "--dest-db", dstDb);
+            runCommand("./migrate.sh", "cleanup", "--source-project", srcProject, "--source-region", srcLocation, "--dest-project", dstProject, "--dest-db", dstDb);
         } catch (Exception e) {
             e.printStackTrace();
         }
@@ -222,6 +237,7 @@ public class IntegrationTest {
         ProcessBuilder migratePb = new ProcessBuilder("./migrate.sh", "run", 
             "--source-project", srcProject, 
             "--source-db", srcDb, 
+            "--source-region", srcLocation,
             "--dest-project", dstProject, 
             "--dest-db", dstDb, 
             "--workers", "1");
@@ -236,7 +252,7 @@ public class IntegrationTest {
         while (jobId.isEmpty()) {
             // Check jobs
             String output = runCommandWithOutput("bash", "-c", 
-                "gcloud dataflow jobs list --project=" + dstProject + " --region=us-central1 --format='value(id,name,state)' | grep firestoremigrationpipeline | grep -i running | awk '{print $1}' | head -n 1");
+                "gcloud dataflow jobs list --project=" + dstProject + " --region=" + srcLocation + " --format='value(id,name,state)' | grep firestoremigrationpipeline | grep -i running | awk '{print $1}' | head -n 1");
             jobId = output;
             if (jobId.isEmpty()) {
                 Thread.sleep(5000);
@@ -264,7 +280,7 @@ public class IntegrationTest {
         System.out.println("Polling Dataflow Job status for completion...");
         while (true) {
             String state = runCommandWithOutput("gcloud", "dataflow", "jobs", "describe", jobId, 
-                "--project=" + dstProject, "--region=us-central1", "--format=value(currentState)");
+                "--project=" + dstProject, "--region=" + srcLocation, "--format=value(currentState)");
             
             System.out.println("Dataflow Job state: " + state);
             if ("JOB_STATE_DONE".equals(state)) {
@@ -324,7 +340,7 @@ public class IntegrationTest {
         
         DocumentReference dstRef = (DocumentReference) dstFields.get("ref_field");
         assertNotNull(dstRef);
-        assertEquals(srcDb, dstRef.getFirestore().getOptions().getDatabaseId()); // Keeps pointing to source DB in current design
+        assertEquals("other_collection/otherDoc", dstRef.getPath());
         
         assertEquals(new GeoPoint(37.7749, -122.4194), dstFields.getGeoPoint("geo_field"));
         

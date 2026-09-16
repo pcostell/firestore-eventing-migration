@@ -27,6 +27,7 @@ This command deploys the live sink, waits 10 minutes for propagation, and starts
 ./migrate.sh run \
   --source-project SOURCE_PROJECT_ID \
   --source-db SOURCE_DATABASE_ID \
+  --source-region SOURCE_REGION \
   --dest-project DEST_PROJECT_ID \
   --dest-db DEST_DATABASE_ID \
   --workers 10
@@ -60,6 +61,7 @@ Once the Dataflow job is complete and you have verified the migration, run clean
 
 ```bash
 ./migrate.sh cleanup \
+  --source-region SOURCE_REGION \
   --dest-project DEST_PROJECT_ID \
   --dest-db DEST_DATABASE_ID
 ```

@@ -51,12 +51,14 @@ usage() {
     echo "Options for 'run':"
     echo "  --source-project ID    Source GCP Project ID"
     echo "  --source-db ID         Source Firestore Database ID"
+    echo "  --source-region REGION Source Firestore Database Region"
     echo "  --dest-project ID      Destination GCP Project ID"
     echo "  --dest-db ID           Destination Firestore Database ID"
     echo "  --workers N            Number of Dataflow workers (default: 5)"
     echo ""
     echo "Options for 'cleanup':"
     echo "  --source-project ID    Source GCP Project ID (optional, defaults to dest)"
+    echo "  --source-region REGION Source Firestore Database Region"
     echo "  --dest-project ID      Destination GCP Project ID"
     echo "  --dest-db ID           Destination Firestore Database ID"
     exit 1
@@ -69,6 +71,7 @@ shift
 
 SOURCE_PROJECT=""
 SOURCE_DB=""
+SOURCE_REGION="${SOURCE_REGION:-}"
 DEST_PROJECT=""
 DEST_DB=""
 WORKERS=5
@@ -77,6 +80,7 @@ while [[ "$#" -gt 0 ]]; do
     case $1 in
         --source-project) SOURCE_PROJECT="$2"; shift ;;
         --source-db) SOURCE_DB="$2"; shift ;;
+        --source-region) SOURCE_REGION="$2"; shift ;;
         --dest-project) DEST_PROJECT="$2"; shift ;;
         --dest-db) DEST_DB="$2"; shift ;;
         --workers) WORKERS="$2"; shift ;;
@@ -88,7 +92,7 @@ done
 # --- Core Logic ---
 
 run_migration() {
-    [[ -z "$SOURCE_PROJECT" || -z "$SOURCE_DB" || -z "$DEST_PROJECT" || -z "$DEST_DB" ]] && usage
+    [[ -z "$SOURCE_PROJECT" || -z "$SOURCE_DB" || -z "$SOURCE_REGION" || -z "$DEST_PROJECT" || -z "$DEST_DB" ]] && usage
 
     log "Starting configuration and migration run..."
 
@@ -179,7 +183,7 @@ run_migration() {
         --trigger-event-filters="type=google.cloud.firestore.document.v1.written,database=$SOURCE_DB" \
         --entry-point=com.google.cloud.firestore.migration.LiveSinkFunction \
         --set-env-vars="DEST_PROJECT=$DEST_PROJECT,DEST_DB=$DEST_DB" \
-        --region=us-central1 \
+        --region="$SOURCE_REGION" \
         --gen2 --quiet \
         --retry \
         --concurrency=50 \
@@ -196,7 +200,7 @@ run_migration() {
     log "Performing fast environment variable push to Cloud Function..."
     gcloud run services update firestore-migration-sink \
         --project="$SOURCE_PROJECT" \
-        --region=us-central1 \
+        --region="$SOURCE_REGION" \
         --update-env-vars="SYNC_START=$SYNC_START" \
         --quiet
 
@@ -211,7 +215,8 @@ run_migration() {
 
     # 4. Start Dataflow Backfill
     log "Running Dataflow Backfill using exec:java..."
-    mvn compile exec:java -pl dataflow -am \
+    mvn install -pl dataflow -am -DskipTests -q || error "Failed to compile Dataflow pipeline."
+    mvn exec:java -pl dataflow \
         -Dexec.mainClass="com.google.cloud.firestore.migration.FirestoreMigrationPipeline" \
         -Dexec.args="--project=\"$DEST_PROJECT\" \
         --sourceProject=\"$SOURCE_PROJECT\" \
@@ -222,30 +227,30 @@ run_migration() {
         --experiments=use_runner_v2 \
         --numWorkers=\"$WORKERS\" \
         --maxNumWorkers=2000 \
-        --region=us-central1"
+        --region=\"$SOURCE_REGION\""
 
     log "Migration run initiated successfully. Monitor the Dataflow job in the Cloud Console."
 }
 
 cleanup_migration() {
     SOURCE_PROJECT="${SOURCE_PROJECT:-$DEST_PROJECT}"
-    [[ -z "$SOURCE_PROJECT" || -z "$DEST_PROJECT" || -z "$DEST_DB" ]] && usage
+    [[ -z "$SOURCE_PROJECT" || -z "$SOURCE_REGION" || -z "$DEST_PROJECT" || -z "$DEST_DB" ]] && usage
 
     log "Starting cleanup for $DEST_PROJECT / $DEST_DB..."
 
     log "Checking for Eventarc triggers..."
-    TRIGGERS=$(gcloud eventarc triggers list --project="$SOURCE_PROJECT" --region=us-central1 --filter="destination.cloudRun.service=firestore-migration-sink" --format="value(name)" 2>/dev/null || true)
+    TRIGGERS=$(gcloud eventarc triggers list --project="$SOURCE_PROJECT" --region="$SOURCE_REGION" --filter="destination.cloudRun.service=firestore-migration-sink" --format="value(name)" 2>/dev/null || true)
     if [[ -n "$TRIGGERS" ]]; then
         if confirm "Delete Eventarc triggers associated with firestore-migration-sink?"; then
             for TRIGGER in $TRIGGERS; do
                 log "Deleting trigger $TRIGGER..."
-                gcloud eventarc triggers delete "$TRIGGER" --project="$SOURCE_PROJECT" --region=us-central1 --quiet || log "Warning: Could not delete trigger $TRIGGER"
+                gcloud eventarc triggers delete "$TRIGGER" --project="$SOURCE_PROJECT" --region="$SOURCE_REGION" --quiet || log "Warning: Could not delete trigger $TRIGGER"
             done
         fi
     fi
 
     if confirm "Delete the Live Journal Sink (Cloud Function)?"; then
-        gcloud functions delete firestore-migration-sink --project="$SOURCE_PROJECT" --region=us-central1 --gen2 --quiet || log "Function not found, skipping."
+        gcloud functions delete firestore-migration-sink --project="$SOURCE_PROJECT" --region="$SOURCE_REGION" --gen2 --quiet || log "Function not found, skipping."
     fi
 
     log "Checking for Log-Based Metrics..."

@@ -10,6 +10,7 @@ target/
 *.log
 *.out
 report.md
+output/
 
 # IDEs
 .idea/

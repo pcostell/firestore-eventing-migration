@@ -28,6 +28,7 @@ fi
 # Parse arguments
 POPULATE_ONLY=false
 EXISTING_SOURCE_DB=""
+SRC_LOCATION="us-central1"
 DEST_LOCATION="us-central1"
 
 usage() {
@@ -37,6 +38,7 @@ usage() {
   echo "  --populate_only          Create and populate the source database, then exit."
   echo "  --existing_source_db ID  Use an existing source database ID. Skips population."
   echo "  --no_cleanup             Do not delete the databases at the end of the test."
+  echo "  --src_location LOC       Location for the source database (default: us-central1)."
   echo "  --dest_location LOC      Location for the destination database (default: us-central1)."
   exit 1
 }
@@ -46,6 +48,7 @@ while [[ "$#" -gt 0 ]]; do
         --populate_only) POPULATE_ONLY=true ;;
         --existing_source_db) EXISTING_SOURCE_DB="$2"; shift ;;
         --no_cleanup) NO_CLEANUP=true ;;
+        --src_location) SRC_LOCATION="$2"; shift ;;
         --dest_location) DEST_LOCATION="$2"; shift ;;
         -h|--help) usage ;;
         *) echo "Unknown parameter passed: $1"; usage ;;
@@ -97,8 +100,8 @@ log_step_end() {
 step_create_databases() {
   local start=$(log_step_start "Create Databases")
   if [ -z "$EXISTING_SOURCE_DB" ]; then
-    echo "Creating Source Database: $SOURCE_DB"
-    gcloud firestore databases create --project="$PROJECT_ID" --database="$SOURCE_DB" --type=firestore-native --location=us-central1 --quiet
+    echo "Creating Source Database: $SOURCE_DB (Location: $SRC_LOCATION)"
+    gcloud firestore databases create --project="$PROJECT_ID" --database="$SOURCE_DB" --type=firestore-native --location="$SRC_LOCATION" --quiet
   else
     echo "Using existing source database: $SOURCE_DB"
   fi
@@ -129,20 +132,20 @@ step_deploy_resources() {
     gcloud run deploy firestore-traffic-generator \
         --source . \
         --project "$PROJECT_ID" \
-        --region us-central1 \
+        --region "$SRC_LOCATION" \
         --set-env-vars "SOURCE_PROJECT=$SOURCE_PROJECT,SOURCE_DB=$SOURCE_DB,COLLECTION_NAME=$COLLECTION_NAME,GOOGLE_FUNCTION_TARGET=com.google.cloud.firestore.migration.load.TrafficGeneratorApp" \
         --max-instances=500 \
         --quiet
         
     PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)")
     gcloud run services add-iam-policy-binding firestore-traffic-generator \
-        --region=us-central1 \
+        --region="$SRC_LOCATION" \
         --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
         --role=roles/run.invoker \
         --project="$PROJECT_ID" \
         --quiet
         
-    TRAFFIC_URL=$(gcloud run services describe firestore-traffic-generator --project "$PROJECT_ID" --region us-central1 --format="value(status.url)")
+    TRAFFIC_URL=$(gcloud run services describe firestore-traffic-generator --project "$PROJECT_ID" --region "$SRC_LOCATION" --format="value(status.url)")
     
     echo "Deploying k6 Load Generator Cloud Run Jobs..."
     mkdir -p k6-build
@@ -191,7 +194,7 @@ EOF
     gcloud run jobs deploy firestore-k6-loader \
         --image gcr.io/"$PROJECT_ID"/firestore-k6-load:latest \
         --project "$PROJECT_ID" \
-        --region us-central1 \
+        --region "$SRC_LOCATION" \
         --tasks 40 \
         --task-timeout 168h \
         --cpu 2 \
@@ -204,7 +207,7 @@ EOF
     gcloud run jobs deploy firestore-k6-traffic \
         --image gcr.io/"$PROJECT_ID"/firestore-k6-load:latest \
         --project "$PROJECT_ID" \
-        --region us-central1 \
+        --region "$SRC_LOCATION" \
         --tasks 40 \
         --task-timeout 168h \
         --cpu 2 \
@@ -223,7 +226,7 @@ step_load_initial_data() {
   echo "Executing Setup Cloud Run Job (k6 Data Loader)..."
   gcloud run jobs execute firestore-k6-loader \
       --project "$PROJECT_ID" \
-      --region us-central1 \
+      --region "$SRC_LOCATION" \
       --wait
   log_step_end "Load Initial Data" "$start"
 }
@@ -233,14 +236,14 @@ step_start_traffic() {
   echo "Starting Live Traffic (k6 in run mode asynchronously)..."
   gcloud run jobs execute firestore-k6-traffic \
       --project "$PROJECT_ID" \
-      --region us-central1
+      --region "$SRC_LOCATION"
   log_step_end "Start Traffic" "$start"
 }
 
 step_initiate_migration() {
   local start=$(log_step_start "Initiate Migration")
   echo "Initiating Migration Pipeline..."
-  NON_INTERACTIVE=true ./migrate.sh run --source-project "$SOURCE_PROJECT" --source-db "$SOURCE_DB" --dest-project "$DEST_PROJECT" --dest-db "$DEST_DB" --workers 50
+  NON_INTERACTIVE=true ./migrate.sh run --source-project "$SOURCE_PROJECT" --source-db "$SOURCE_DB" --source-region "$SRC_LOCATION" --dest-project "$DEST_PROJECT" --dest-db "$DEST_DB" --workers 50
   log_step_end "Initiate Migration" "$start"
 }
 
@@ -249,7 +252,7 @@ step_wait_for_dataflow() {
   echo "Waiting for Dataflow Backfill to appear..."
   JOB_ID=""
   for i in {1..60}; do
-    JOB_ID=$(gcloud dataflow jobs list --project="$PROJECT_ID" --region=us-central1 --status=active --format="value(id)" --limit=1)
+    JOB_ID=$(gcloud dataflow jobs list --project="$PROJECT_ID" --region="$SRC_LOCATION" --status=active --format="value(id)" --limit=1)
     if [ -n "$JOB_ID" ]; then
       break
     fi
@@ -264,7 +267,7 @@ step_wait_for_dataflow() {
 
   echo "Found Dataflow job: $JOB_ID. Waiting for completion..."
   while true; do
-    STATUS=$(gcloud dataflow jobs describe "$JOB_ID" --project="$PROJECT_ID" --region=us-central1 --format="value(currentState)")
+    STATUS=$(gcloud dataflow jobs describe "$JOB_ID" --project="$PROJECT_ID" --region="$SRC_LOCATION" --format="value(currentState)")
     echo "Dataflow job state: $STATUS"
     if [ "$STATUS" = "JOB_STATE_DONE" ]; then
       break
@@ -317,10 +320,10 @@ step_run_lag_monitor() {
 step_stop_load_generator() {
   local start=$(log_step_start "Stop Load Generator")
   echo "Stopping all active k6 Live Traffic executions..."
-  ACTIVE_EXECS=$(gcloud run jobs executions list --job firestore-k6-traffic --project="$PROJECT_ID" --region us-central1 --format="json" | jq -r '.[] | select(.status.completionTime == null) | .metadata.name')
+  ACTIVE_EXECS=$(gcloud run jobs executions list --job firestore-k6-traffic --project="$PROJECT_ID" --region "$SRC_LOCATION" --format="json" | jq -r '.[] | select(.status.completionTime == null) | .metadata.name')
   for exec_name in $ACTIVE_EXECS; do
     echo "Cancelling active execution: $exec_name"
-    gcloud run jobs executions cancel "$exec_name" --project="$PROJECT_ID" --region us-central1 --quiet || true
+    gcloud run jobs executions cancel "$exec_name" --project="$PROJECT_ID" --region "$SRC_LOCATION" --quiet || true
   done
   log_step_end "Stop Load Generator" "$start"
 }
@@ -353,23 +356,24 @@ step_verification() {
   (
     cd load-tests
     mkdir -p ../output
+    gcloud storage buckets create "gs://run-sources-${PROJECT_ID}-${SRC_LOCATION}" --location="$SRC_LOCATION" --project="$PROJECT_ID" 2>/dev/null || true
     echo "Running Pass 1: Sharded Hashing on Cloud Dataflow..."
     mvn exec:java -Dexec.mainClass="com.google.cloud.firestore.migration.load.ParallelVerificationPipeline" \
       -Dexec.args="--runner=DataflowRunner \
       --project=$PROJECT_ID \
-      --region=us-central1 \
-      --tempLocation=gs://run-sources-${PROJECT_ID}-us-central1/dataflow/temp \
-      --gcpTempLocation=gs://run-sources-${PROJECT_ID}-us-central1/dataflow/gcp-temp \
-      --stagingLocation=gs://run-sources-${PROJECT_ID}-us-central1/dataflow/staging \
+      --region=$SRC_LOCATION \
+      --tempLocation=gs://run-sources-${PROJECT_ID}-${SRC_LOCATION}/dataflow/temp \
+      --gcpTempLocation=gs://run-sources-${PROJECT_ID}-${SRC_LOCATION}/dataflow/gcp-temp \
+      --stagingLocation=gs://run-sources-${PROJECT_ID}-${SRC_LOCATION}/dataflow/staging \
       --sourceProject=$SOURCE_PROJECT \
       --sourceDatabase=$SOURCE_DB \
       --destProject=$DEST_PROJECT \
       --destDatabase=$DEST_DB \
       --collectionName=$COLLECTION_NAME \
-      --reportPath=gs://run-sources-${PROJECT_ID}-us-central1/dataflow/reports/detailed-diff-report.txt"
+      --reportPath=gs://run-sources-${PROJECT_ID}-${SRC_LOCATION}/dataflow/reports/detailed-diff-report.txt"
     
     # Safely download the unified GCS report locally to output directory
-    gcloud storage cp gs://run-sources-${PROJECT_ID}-us-central1/dataflow/reports/detailed-diff-report.txt ../output/detailed-diff-report.txt || true
+    gcloud storage cp gs://run-sources-${PROJECT_ID}-${SRC_LOCATION}/dataflow/reports/detailed-diff-report.txt ../output/detailed-diff-report.txt || true
   )
   log_step_end "Verification" "$start"
 }
@@ -380,6 +384,8 @@ step_cleanup_databases() {
     return 0
   fi
   local start=$(log_step_start "Cleanup Databases")
+  echo "Cleaning up migration infrastructure..."
+  NON_INTERACTIVE=true ./migrate.sh cleanup --source-project "$SOURCE_PROJECT" --source-region "$SRC_LOCATION" --dest-project "$DEST_PROJECT" --dest-db "$DEST_DB" || echo "Warning: Failed to cleanup migration infra"
   if [ -z "$EXISTING_SOURCE_DB" ]; then
     echo "Deleting Source Database: $SOURCE_DB"
     gcloud firestore databases delete --project="$PROJECT_ID" --database="$SOURCE_DB" --quiet || echo "Warning: Failed to delete source DB $SOURCE_DB"
