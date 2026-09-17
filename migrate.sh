@@ -270,13 +270,21 @@ cleanup_migration() {
         fi
     fi
 
-    log "Performing bulk delete of _ShadowJournal collection group..."
-    if confirm "Delete all documents in the '_ShadowJournal' collection group?"; then
-        gcloud alpha firestore bulk-delete \
-            --collection-ids="_ShadowJournal" \
-            --project="$DEST_PROJECT" \
-            --database="$DEST_DB" \
-            --quiet
+    log "Checking destination database edition..."
+    DB_DESC=$(gcloud firestore databases describe --project="$DEST_PROJECT" --database="$DEST_DB" --format=json)
+    DB_EDITION=$(echo "$DB_DESC" | grep -oP '"databaseEdition":\s*"\K[^"]+' || echo "STANDARD")
+
+    if [[ "$DB_EDITION" == "ENTERPRISE" ]]; then
+        log "Destination database is Enterprise edition. Please manually perform a drop collection for '_ShadowJournal' rather than initiating bulk-delete."
+    else
+        if confirm "Delete all documents in the '_ShadowJournal' collection group?"; then
+            log "Performing bulk delete of _ShadowJournal collection group..."
+            gcloud alpha firestore bulk-delete \
+                --collection-ids="_ShadowJournal" \
+                --project="$DEST_PROJECT" \
+                --database="$DEST_DB" \
+                --quiet
+        fi
     fi
 
     log "Cleanup complete."
